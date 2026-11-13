@@ -354,6 +354,15 @@ do $$ begin
   begin revoke execute on all functions in schema public from public, anon, authenticated; exception when others then null; end;
 end $$;
 -- كل دوال الواجهة (التي تأخذ jsonb) متاحة للمستخدم المسجَّل فقط
+-- لوحة البائع: كل الشركات المشتركة (للمنصة فقط، بلا اطلاع على بيانات الشركات)
+create or replace function public.platform_tenants(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+begin
+  perform app.demo_admin();
+  return coalesce((select jsonb_agg(jsonb_build_object('code', t.code, 'name', t.name, 'plan', t.plan, 'status', t.status, 'expires_at', (t.expires_at + case when t.settings ? 'demo' then 7 else 0 end)::text,
+    'users', (select count(*) from acc.members m where m.tenant_id = t.id), 'max_users', t.max_users, 'entities', (select count(*) from acc.entities e where e.tenant_id = t.id), 'max_entities', t.max_entities,
+    'last_login', (select max(m.last_login) from acc.members m where m.tenant_id = t.id), 'demo', t.settings ? 'demo') order by t.created_at desc) from acc.tenants t), '[]'::jsonb);
+end $$;
+
 do $$ declare f record; begin
   for f in select p.oid::regprocedure as sig, p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.prokind = 'f' and p.proowner = (select oid from pg_roles where rolname = current_user)
       and (p.proname in ('login_email','register_company','ingest_journal','signup_status') or p.pronargs = 0 or p.proargtypes::text = (select oid::text from pg_type where typname = 'jsonb')) loop
