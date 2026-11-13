@@ -2842,6 +2842,226 @@ begin
   begin res := res || jsonb_build_object('missing_attachments', jsonb_array_length(public.att_missing(p))); exception when others then null; end;
   return res;
 end $$;
+-- ===== sql/016_analytics.sql =====
+-- مُحكَم للحسابات — التحليل المالي والنسب المالية (قراءة فقط من الأستاذ المرحّل)
+-- كل الأرقام تُشتق من نفس الأستاذ الذي تُبنى منه القوائم، فتتطابق معها. التصنيف (متداول/غير متداول، تكلفة/مصروف…) يُستنتج
+-- من نوع الحساب الفرعي ثم من أسماء المجموعات الأعلى في الشجرة، فيعمل مع أي دليل حسابات (قالب أو مستورد أو يدوي).
+
+create or replace function app.div(a numeric, b numeric) returns numeric language sql immutable as $$
+  select case when b is null or b = 0 or a is null then null else a / b end $$;
+
+-- تصنيف الحسابات لأغراض التحليل
+create or replace function app.fin_map(t uuid) returns table (account_id uuid, cls text, is_dep boolean) language sql stable security definer set search_path = public, acc as $$
+  with recursive anc(id, a, d) as (
+    select a.id, a.parent_id, 1 from acc.accounts a where a.tenant_id = t and a.parent_id is not null
+    union all select anc.id, p.parent_id, anc.d + 1 from anc join acc.accounts p on p.tenant_id = t and p.id = anc.a where p.parent_id is not null),
+  path as (select anc.id, string_agg(g.name || ' ' || g.name_en, ' | ') names from anc join acc.accounts g on g.tenant_id = t and g.id = anc.a group by anc.id),
+  x as (select a.id, a.type, a.subtype, a.name || ' ' || a.name_en nm, coalesce(pa.names, '') anc_names from acc.accounts a left join path pa on pa.id = a.id where a.tenant_id = t and not a.is_group),
+  y as (select x.*,
+      x.anc_names ~* '(غير المتداول|طويل[ةه]? الأجل|non-?current|long-?term)' nc,
+      x.anc_names ~* '(المتداول|قصير[ةه]? الأجل|current|short-?term)' and not x.anc_names ~* '(غير المتداول|non-?current)' cur,
+      x.nm ~* '(قرض|قروض|loan|تمويل بنكي|مرابحة|تورق)' loanish,
+      x.nm ~* '(إهلاك|استهلاك|اهلاك|depreciation|amortiz)' dep_nm
+    from x)
+  select y.id,
+    case y.type
+      when 'asset' then case
+        when y.subtype in ('cash','bank') then 'cash'
+        when y.subtype in ('receivable','allowance') then 'ar'
+        when y.subtype = 'inventory' then 'inv'
+        when y.subtype in ('fixed','fixed_asset','accum_dep','intangible','investment') or y.nc then 'nca'
+        else 'oca' end
+      when 'liability' then case
+        when y.subtype = 'payable' then 'ap'
+        when y.loanish and y.nc then 'ltd'
+        when y.loanish and y.subtype = 'loan' and not y.cur then 'ltd'
+        when y.loanish then 'std'
+        when y.nc or y.subtype = 'provision' and not y.cur then 'ncl'
+        else 'cl' end
+      when 'equity' then case when y.subtype = 'retained_earnings' then 're' else 'eq' end
+      when 'revenue' then case when y.anc_names ~* '(أخرى|other)' and y.subtype <> 'revenue_sales' then 'rev_oth' else 'rev' end
+      else case
+        when y.subtype = 'interest' or y.nm ~* '(فوائد|أعباء تمويل|اعباء تمويل|interest|finance cost)' then 'int'
+        when y.subtype in ('tax','zakat') or y.nm ~* '(زكاة|ضريبة دخل|zakat|income tax)' then 'tax'
+        when y.subtype = 'cogs' or y.anc_names ~* '(تكلفة الإيرادات|تكلفة المبيعات|cost of (revenue|sales|goods))' then 'cogs'
+        when y.anc_names ~* '(تمويلية|أخرى|other)' and not y.anc_names ~* '(تشغيل|operating)' then 'oth'
+        else 'opex' end
+    end,
+    (y.type = 'expense' and (y.subtype = 'depreciation' or y.dep_nm))
+  from y $$;
+
+-- أرصدة الميزانية (مدينة موجبة) مجمّعة بالتصنيف حتى تاريخ معيّن
+create or replace function app.fin_bal(t uuid, ents uuid[], asof date) returns jsonb language plpgsql stable security definer set search_path = public, acc, app as $$
+declare r jsonb;
+begin
+  select coalesce(jsonb_object_agg(k, v), '{}'::jsonb) into r from (
+    select mp.cls k, sum(l.debit - l.credit) v from acc.journal_lines l join app.fin_map(t) mp on mp.account_id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and l.date <= asof and mp.cls in ('cash','ar','inv','oca','nca','ap','std','cl','ltd','ncl','eq','re')
+    group by 1) z;
+  r := r || jsonb_build_object('pl', (select coalesce(sum(l.debit - l.credit), 0) from acc.journal_lines l join acc.accounts a on a.tenant_id = l.tenant_id and a.id = l.account_id
+      where l.tenant_id = t and l.posted and l.entity_id = any(ents) and l.date <= asof and a.type in ('revenue','expense')));
+  return r;
+end $$;
+
+-- حركة الفترة (بدون قيود الإقفال): إيرادات موجبة، مصروفات موجبة
+create or replace function app.fin_flow(t uuid, ents uuid[], df date, dt date) returns jsonb language plpgsql stable security definer set search_path = public, acc, app as $$
+declare r jsonb; dep numeric;
+begin
+  select coalesce(jsonb_object_agg(k, v), '{}'::jsonb) into r from (
+    select mp.cls k, sum(case when mp.cls in ('rev','rev_oth') then l.credit - l.debit else l.debit - l.credit end) v
+    from acc.journal_lines l join acc.journals j on j.tenant_id = l.tenant_id and j.id = l.journal_id join app.fin_map(t) mp on mp.account_id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and l.date between df and dt and mp.cls in ('rev','rev_oth','cogs','opex','int','tax','oth')
+      and not (j.type = 'CL' or exists (select 1 from acc.journals o where o.tenant_id = j.tenant_id and o.id = j.reversal_of and o.type = 'CL'))
+    group by 1) z;
+  select coalesce(sum(l.debit - l.credit), 0) into dep from acc.journal_lines l join acc.journals j on j.tenant_id = l.tenant_id and j.id = l.journal_id join app.fin_map(t) mp on mp.account_id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and l.date between df and dt and mp.is_dep
+      and not (j.type = 'CL' or exists (select 1 from acc.journals o where o.tenant_id = j.tenant_id and o.id = j.reversal_of and o.type = 'CL'));
+  return r || jsonb_build_object('dep', dep);
+end $$;
+
+create or replace function app.n(j jsonb, k text) returns numeric language sql immutable as $$ select coalesce((j->>k)::numeric, 0) $$;
+
+-- القيم الأساسية لفترة: الأرصدة الختامية والافتتاحية والحركة + المجاميع المشتقة
+create or replace function app.fin_base(t uuid, ents uuid[], df date, dt date) returns jsonb language plpgsql stable security definer set search_path = public, acc, app as $$
+declare cl jsonb := app.fin_bal(t, ents, dt); op jsonb := app.fin_bal(t, ents, df - 1); fl jsonb := app.fin_flow(t, ents, df, dt);
+  ca numeric; cul numeric; ta numeric; tl numeric; eq numeric; oca numeric; ocul numeric; ota numeric; otl numeric; oeq numeric;
+  rev numeric; cogs numeric; opex numeric; ebit numeric; ni numeric; interest numeric; tax numeric; roth numeric; oth numeric;
+begin
+  ca := app.n(cl,'cash') + app.n(cl,'ar') + app.n(cl,'inv') + app.n(cl,'oca');
+  cul := -(app.n(cl,'ap') + app.n(cl,'std') + app.n(cl,'cl'));
+  ta := ca + app.n(cl,'nca'); tl := cul - (app.n(cl,'ltd') + app.n(cl,'ncl'));
+  eq := ta - tl;                                   -- حقوق الملكية = الأصول − الالتزامات (متطابقة محاسبيًا مع رأس المال + المبقاة + ربح الفترة)
+  oca := app.n(op,'cash') + app.n(op,'ar') + app.n(op,'inv') + app.n(op,'oca'); ocul := -(app.n(op,'ap') + app.n(op,'std') + app.n(op,'cl'));
+  ota := oca + app.n(op,'nca'); otl := ocul - (app.n(op,'ltd') + app.n(op,'ncl')); oeq := ota - otl;
+  rev := app.n(fl,'rev'); cogs := app.n(fl,'cogs'); opex := app.n(fl,'opex'); interest := app.n(fl,'int'); tax := app.n(fl,'tax'); roth := app.n(fl,'rev_oth'); oth := app.n(fl,'oth');
+  ebit := rev - cogs - opex; ni := rev + roth - cogs - opex - interest - tax - oth;
+  return jsonb_build_object('from', df, 'to', dt, 'days', (dt - df + 1),
+    'cash', app.n(cl,'cash'), 'ar', app.n(cl,'ar'), 'inv', app.n(cl,'inv'), 'oca', app.n(cl,'oca'), 'nca', app.n(cl,'nca'),
+    'ap', -app.n(cl,'ap'), 'std', -app.n(cl,'std'), 'cl_other', -app.n(cl,'cl'), 'ltd', -app.n(cl,'ltd'), 'ncl', -app.n(cl,'ncl'),
+    'ca', ca, 'cl', cul, 'ta', ta, 'tl', tl, 'equity', eq, 're', -(app.n(cl,'re') + app.n(cl,'pl')),
+    'o_ar', app.n(op,'ar'), 'o_inv', app.n(op,'inv'), 'o_ap', -app.n(op,'ap'), 'o_ta', ota, 'o_equity', oeq, 'o_cash', app.n(op,'cash'),
+    'revenue', rev, 'other_income', roth, 'cogs', cogs, 'opex', opex, 'interest', interest, 'tax', tax, 'other_exp', oth, 'dep', app.n(fl,'dep'),
+    'gross', rev - cogs, 'ebit', ebit, 'ebitda', ebit + app.n(fl,'dep'), 'net', ni);
+end $$;
+
+-- النسب من القيم الأساسية
+create or replace function app.fin_ratios_of(b jsonb) returns jsonb language plpgsql immutable as $$
+declare d numeric := greatest(app.n(b,'days'), 1); ann numeric := 365 / greatest(app.n(b,'days'), 1);
+  rev numeric := app.n(b,'revenue'); cogs numeric := app.n(b,'cogs'); ni numeric := app.n(b,'net'); ebit numeric := app.n(b,'ebit');
+  ca numeric := app.n(b,'ca'); cl numeric := app.n(b,'cl'); ta numeric := app.n(b,'ta'); tl numeric := app.n(b,'tl'); eq numeric := app.n(b,'equity');
+  debt numeric := app.n(b,'std') + app.n(b,'ltd'); avg_ta numeric; avg_eq numeric; avg_ar numeric; avg_inv numeric; avg_ap numeric;
+  dso numeric; dio numeric; dpo numeric; z numeric;
+begin
+  avg_ta := case when app.n(b,'o_ta') <> 0 then (ta + app.n(b,'o_ta')) / 2 else ta end;
+  avg_eq := case when app.n(b,'o_equity') <> 0 then (eq + app.n(b,'o_equity')) / 2 else eq end;
+  avg_ar := case when app.n(b,'o_ar') <> 0 then (app.n(b,'ar') + app.n(b,'o_ar')) / 2 else app.n(b,'ar') end;
+  avg_inv := case when app.n(b,'o_inv') <> 0 then (app.n(b,'inv') + app.n(b,'o_inv')) / 2 else app.n(b,'inv') end;
+  avg_ap := case when app.n(b,'o_ap') <> 0 then (app.n(b,'ap') + app.n(b,'o_ap')) / 2 else app.n(b,'ap') end;
+  dso := app.div(avg_ar, rev) * d; dio := app.div(avg_inv, cogs) * d; dpo := app.div(avg_ap, cogs) * d;
+  z := case when ta <> 0 and tl <> 0 then 6.56 * ((ca - cl) / ta) + 3.26 * (app.n(b,'re') / ta) + 6.72 * ((ebit * ann) / ta) + 1.05 * (eq / tl) end;
+  return jsonb_build_object(
+    'current_ratio', app.div(ca, cl), 'quick_ratio', app.div(app.n(b,'cash') + app.n(b,'ar'), cl), 'cash_ratio', app.div(app.n(b,'cash'), cl),
+    'working_capital', ca - cl, 'wc_to_assets', app.div(ca - cl, ta),
+    'gross_margin', app.div(rev - cogs, rev), 'operating_margin', app.div(ebit, rev), 'ebitda_margin', app.div(app.n(b,'ebitda'), rev), 'net_margin', app.div(ni, rev),
+    'cogs_ratio', app.div(cogs, rev), 'opex_ratio', app.div(app.n(b,'opex'), rev),
+    'roa', app.div(ni, avg_ta), 'roe', app.div(ni, avg_eq), 'roa_ann', app.div(ni, avg_ta) * ann, 'roe_ann', app.div(ni, avg_eq) * ann, 'roce', app.div(ebit, ta - cl),
+    'dso', dso, 'dio', dio, 'dpo', dpo, 'ccc', case when dso is not null then dso + coalesce(dio, 0) - coalesce(dpo, 0) end,
+    'asset_turnover', app.div(rev, avg_ta), 'ar_turnover', app.div(rev, avg_ar), 'inventory_turnover', app.div(cogs, avg_inv), 'fixed_turnover', app.div(rev, app.n(b,'nca')),
+    'debt_to_equity', app.div(debt, eq), 'liab_to_equity', app.div(tl, eq), 'debt_to_assets', app.div(tl, ta), 'equity_ratio', app.div(eq, ta), 'equity_multiplier', app.div(avg_ta, avg_eq),
+    'interest_cover', app.div(ebit, app.n(b,'interest')), 'net_debt', debt - app.n(b,'cash'), 'net_debt_to_ebitda', app.div(debt - app.n(b,'cash'), app.n(b,'ebitda') * ann),
+    'altman_z', z,
+    'dupont', jsonb_build_object('net_margin', app.div(ni, rev), 'asset_turnover', app.div(rev, avg_ta), 'equity_multiplier', app.div(avg_ta, avg_eq), 'roe', app.div(ni, avg_eq)));
+end $$;
+
+-- سلسلة شهرية (آخر n شهرًا) لأهم الأرقام والنسب
+create or replace function app.fin_series(t uuid, ents uuid[], dt date, n int) returns jsonb language plpgsql stable security definer set search_path = public, acc, app as $$
+declare res jsonb;
+begin
+  with mp as (select * from app.fin_map(t)),
+  mm as (select date_trunc('month', l.date)::date mo, mp.cls,
+      sum(l.debit - l.credit) net_all,
+      sum(case when not (j.type = 'CL' or exists (select 1 from acc.journals o where o.tenant_id = j.tenant_id and o.id = j.reversal_of and o.type = 'CL')) then l.debit - l.credit else 0 end) net_x
+    from acc.journal_lines l join acc.journals j on j.tenant_id = l.tenant_id and j.id = l.journal_id join mp on mp.account_id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and l.date <= dt group by 1, 2),
+  ms as (select (date_trunc('month', dt) - (g || ' month')::interval)::date m from generate_series(0, greatest(n, 1) - 1) g),
+  s as (select ms.m,
+      coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls = 'cash'), 0) cash, coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls = 'ar'), 0) ar,
+      coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls = 'inv'), 0) inv, coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls = 'oca'), 0) oca,
+      coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls = 'nca'), 0) nca,
+      -coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls in ('ap','std','cl')), 0) cl,
+      -coalesce(sum(mm.net_all) filter (where mm.mo <= ms.m and mm.cls in ('ltd','ncl')), 0) ncl,
+      coalesce(sum(-mm.net_x) filter (where mm.mo = ms.m and mm.cls = 'rev'), 0) rev, coalesce(sum(-mm.net_x) filter (where mm.mo = ms.m and mm.cls = 'rev_oth'), 0) roth,
+      coalesce(sum(mm.net_x) filter (where mm.mo = ms.m and mm.cls = 'cogs'), 0) cogs, coalesce(sum(mm.net_x) filter (where mm.mo = ms.m and mm.cls = 'opex'), 0) opex,
+      coalesce(sum(mm.net_x) filter (where mm.mo = ms.m and mm.cls in ('int','tax','oth')), 0) below
+    from ms cross join mm group by ms.m),
+  s2 as (select s.*, (cash + ar + inv + oca) ca, (cash + ar + inv + oca + nca) ta, (cl + ncl) tl, (rev + roth - cogs - opex - below) net from s)
+  select coalesce(jsonb_agg(jsonb_build_object('month', to_char(m, 'YYYY-MM'), 'revenue', rev, 'cogs', cogs, 'opex', opex, 'net', net, 'cash', cash, 'ar', ar, 'inv', inv,
+      'ca', ca, 'cl', cl, 'ta', ta, 'tl', tl, 'equity', ta - tl, 'current_ratio', app.div(ca, cl), 'gross_margin', app.div(rev - cogs, rev), 'net_margin', app.div(net, rev),
+      'debt_ratio', app.div(tl, ta)) order by m), '[]'::jsonb) into res from s2;
+  return res;
+end $$;
+
+-- الواجهة: التحليل المالي لفترة مع مقارنة (افتراضيًا: نفس الفترة من السنة السابقة)
+create or replace function public.fin_ratios(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p);
+  dt date := coalesce(nullif(p->>'to','')::date, current_date); df date := coalesce(nullif(p->>'from','')::date, date_trunc('year', dt)::date);
+  cf date := coalesce(nullif(p->>'cmp_from','')::date, (df - interval '1 year')::date); ct date := coalesce(nullif(p->>'cmp_to','')::date, (dt - interval '1 year')::date);
+  cur jsonb; pri jsonb; rc jsonb; rp jsonb; cfl jsonb; cfp jsonb; sub jsonb := p - 'from' - 'to' - 'cmp_from' - 'cmp_to';
+begin
+  if df > dt or cf > ct then raise exception 'الفترة غير صحيحة'; end if;
+  cur := app.fin_base(t, ents, df, dt); pri := app.fin_base(t, ents, cf, ct); rc := app.fin_ratios_of(cur); rp := app.fin_ratios_of(pri);
+  begin cfl := public.rpt_cashflow(sub || jsonb_build_object('from', df, 'to', dt)); cfp := public.rpt_cashflow(sub || jsonb_build_object('from', cf, 'to', ct));
+  exception when others then cfl := null; cfp := null; end;
+  return jsonb_build_object('from', df, 'to', dt, 'cmp_from', cf, 'cmp_to', ct,
+    'cur', cur, 'prior', pri, 'ratios', rc || jsonb_build_object('ocf', app.n(cfl,'operating'), 'icf', app.n(cfl,'investing'), 'fcf', app.n(cfl,'operating') + app.n(cfl,'investing'),
+        'ocf_to_ni', app.div(app.n(cfl,'operating'), app.n(cur,'net')), 'ocf_to_cl', app.div(app.n(cfl,'operating'), app.n(cur,'cl'))),
+    'prior_ratios', rp || jsonb_build_object('ocf', app.n(cfp,'operating'), 'icf', app.n(cfp,'investing'), 'fcf', app.n(cfp,'operating') + app.n(cfp,'investing'),
+        'ocf_to_ni', app.div(app.n(cfp,'operating'), app.n(pri,'net')), 'ocf_to_cl', app.div(app.n(cfp,'operating'), app.n(pri,'cl'))),
+    'growth', jsonb_build_object('revenue', app.div(app.n(cur,'revenue') - app.n(pri,'revenue'), abs(app.n(pri,'revenue'))), 'net', app.div(app.n(cur,'net') - app.n(pri,'net'), abs(app.n(pri,'net'))),
+        'assets', app.div(app.n(cur,'ta') - app.n(pri,'ta'), abs(app.n(pri,'ta'))), 'equity', app.div(app.n(cur,'equity') - app.n(pri,'equity'), abs(app.n(pri,'equity')))),
+    'cash_flow', jsonb_build_object('opening', app.n(cfl,'opening_cash'), 'closing', app.n(cfl,'closing_cash'), 'operating', app.n(cfl,'operating'), 'investing', app.n(cfl,'investing'), 'financing', app.n(cfl,'financing')),
+    'series', case when coalesce((p->>'trend')::boolean, true) then app.fin_series(t, ents, dt, least(greatest(coalesce(nullif(p->>'months','')::int, 12), 3), 36)) else '[]'::jsonb end);
+end $$;
+
+-- مقارنة الشركات (الكيانات) داخل المجموعة: لكل شركة أهم الأرقام والنسب + إجمالي المجموعة
+create or replace function public.fin_by_entity(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p);
+  dt date := coalesce(nullif(p->>'to','')::date, current_date); df date := coalesce(nullif(p->>'from','')::date, date_trunc('year', dt)::date); e record; rows jsonb := '[]'::jsonb; b jsonb;
+begin
+  for e in select id, code, name from acc.entities where tenant_id = t and id = any(ents) and active order by code loop
+    b := app.fin_base(t, array[e.id], df, dt);
+    rows := rows || jsonb_build_array(jsonb_build_object('id', e.id, 'code', e.code, 'name', e.name, 'base', b, 'ratios', app.fin_ratios_of(b)));
+  end loop;
+  b := app.fin_base(t, ents, df, dt);
+  return jsonb_build_object('from', df, 'to', dt, 'rows', rows, 'group', jsonb_build_object('base', b, 'ratios', app.fin_ratios_of(b)));
+end $$;
+
+-- بنود القوائم بتصنيف التحليل (للتحليل الرأسي والأفقي): الدخل للفترة، والمركز المالي في نهاية الفترة، مع المقارنة
+create or replace function public.fin_lines(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p);
+  dt date := coalesce(nullif(p->>'to','')::date, current_date); df date := coalesce(nullif(p->>'from','')::date, date_trunc('year', dt)::date);
+  cf date := coalesce(nullif(p->>'cmp_from','')::date, (df - interval '1 year')::date); ct date := coalesce(nullif(p->>'cmp_to','')::date, (dt - interval '1 year')::date);
+  pl jsonb; bs jsonb; un numeric; unc numeric;
+begin
+  select coalesce(jsonb_agg(jsonb_build_object('code', a.code, 'name', a.name, 'cls', mp.cls, 'amount', x.cur, 'cmp', x.prv) order by a.code), '[]'::jsonb) into pl
+  from (select l.account_id,
+      coalesce(sum(case when l.date between df and dt then case when a.type = 'revenue' then l.credit - l.debit else l.debit - l.credit end end), 0) cur,
+      coalesce(sum(case when l.date between cf and ct then case when a.type = 'revenue' then l.credit - l.debit else l.debit - l.credit end end), 0) prv
+    from acc.journal_lines l join acc.journals j on j.tenant_id = l.tenant_id and j.id = l.journal_id join acc.accounts a on a.tenant_id = l.tenant_id and a.id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and a.type in ('revenue','expense') and (l.date between df and dt or l.date between cf and ct)
+      and not (j.type = 'CL' or exists (select 1 from acc.journals o where o.tenant_id = j.tenant_id and o.id = j.reversal_of and o.type = 'CL'))
+    group by 1) x join acc.accounts a on a.tenant_id = t and a.id = x.account_id join app.fin_map(t) mp on mp.account_id = a.id where x.cur <> 0 or x.prv <> 0;
+  select coalesce(jsonb_agg(jsonb_build_object('code', a.code, 'name', a.name, 'cls', mp.cls, 'amount', x.cur, 'cmp', x.prv) order by a.code), '[]'::jsonb) into bs
+  from (select l.account_id,
+      coalesce(sum(case when l.date <= dt then case when a.type = 'asset' then l.debit - l.credit else l.credit - l.debit end end), 0) cur,
+      coalesce(sum(case when l.date <= ct then case when a.type = 'asset' then l.debit - l.credit else l.credit - l.debit end end), 0) prv
+    from acc.journal_lines l join acc.accounts a on a.tenant_id = l.tenant_id and a.id = l.account_id
+    where l.tenant_id = t and l.posted and l.entity_id = any(ents) and a.type in ('asset','liability','equity') and l.date <= greatest(dt, ct) group by 1) x
+    join acc.accounts a on a.tenant_id = t and a.id = x.account_id join app.fin_map(t) mp on mp.account_id = a.id where x.cur <> 0 or x.prv <> 0;
+  select coalesce(sum(case when l.date <= dt then l.credit - l.debit end), 0), coalesce(sum(case when l.date <= ct then l.credit - l.debit end), 0) into un, unc
+    from acc.journal_lines l join acc.accounts a on a.tenant_id = l.tenant_id and a.id = l.account_id where l.tenant_id = t and l.posted and l.entity_id = any(ents) and a.type in ('revenue','expense');
+  return jsonb_build_object('from', df, 'to', dt, 'cmp_from', cf, 'cmp_to', ct, 'pl', pl, 'bs', bs, 'unclosed', un, 'cmp_unclosed', unc);
+end $$;
 -- ===== sql/090_templates.sql =====
 -- مُولَّد آليًا من db/templates/build_templates.py — لا تُعدَّل يدويًا
 create table if not exists app.coa_templates (key text primary key, name text not null, description text not null default '', rows jsonb not null);
