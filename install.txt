@@ -1166,7 +1166,7 @@ begin return (select to_jsonb(x) - 'created_ip' - 'id' || jsonb_build_object('se
 create or replace function public.settings_set(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
 declare t uuid := app.need_sys('settings'); s jsonb := coalesce(p->'settings','{}'::jsonb); k text; cur jsonb;
 begin
-  for k in select jsonb_object_keys(s) loop if k not in ('approval','controls','format','invoice','brand','tax','locale') then raise exception 'إعداد غير مسموح: %', k; end if; end loop;
+  for k in select jsonb_object_keys(s) loop if k not in ('approval','controls','format','invoice','brand','tax','locale','consol') then raise exception 'إعداد غير مسموح: %', k; end if; end loop;
   if s ? 'brand' then
     if length(coalesce(s->'brand'->>'logo','')) > 450000 or length(coalesce(s->'brand'->>'stamp','')) > 450000 or length(coalesce(s->'brand'->>'signature','')) > 450000 then raise exception 'الصورة كبيرة — الحد 300 كيلوبايت تقريبًا'; end if;
     if exists (select 1 from jsonb_each_text(s->'brand') b where b.value is not null and b.value <> '' and b.value !~ '^data:image/(png|jpeg|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$') then raise exception 'صيغة الصورة غير مدعومة (PNG/JPG/WebP/SVG)'; end if;
@@ -2707,6 +2707,140 @@ begin
         and (df is null or i.date >= df) and (dt is null or i.date <= dt)
         and (q is null or i.number ilike '%'||q||'%' or i.supplier_ref ilike '%'||q||'%' or pa.name ilike '%'||q||'%' or pa.vat_no ilike '%'||q||'%')
       order by i.date, i.number nulls last, i.id limit lim offset off) x);
+end $$;
+-- ===== sql/015_ops.sql =====
+-- عمليات متقدمة: قيود دورية/إطفاء، قوائم مجمّعة بحذف التعاملات البينية، أسعار صرف وتقييم عملات، بوابة الذكاء الاصطناعي
+create table if not exists acc.recurring (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, id uuid not null default gen_random_uuid(), entity_id uuid not null, name text not null,
+  every text not null check (every in ('month','quarter','year')), next_date date not null, end_date date, memo text not null default '', lines jsonb not null,
+  active boolean not null default true, last_run date, runs int not null default 0, created_by uuid, created_at timestamptz not null default now(), primary key (tenant_id, id));
+create table if not exists acc.fx_rates (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, currency text not null, date date not null, rate numeric(18,6) not null check (rate > 0), created_by uuid, primary key (tenant_id, currency, date));
+alter table acc.recurring enable row level security; alter table acc.fx_rates enable row level security;
+
+create or replace function public.rec_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('journals','view'); ents uuid[] := app.pick_ents(p);
+begin return coalesce((select jsonb_agg(to_jsonb(r) - 'tenant_id' || jsonb_build_object('entity', e.name) order by r.next_date) from acc.recurring r join acc.entities e on e.tenant_id = r.tenant_id and e.id = r.entity_id where r.tenant_id = t and r.entity_id = any(ents)), '[]'::jsonb); end $$;
+
+create or replace function public.rec_save(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('journals','add'); rid uuid := nullif(p->>'id','')::uuid; e uuid := (p->>'entity')::uuid; dr numeric; cr numeric;
+begin
+  if not (e = any(app.ents())) then raise exception 'ليست لديك صلاحية على هذا الكيان'; end if;
+  if jsonb_typeof(p->'lines') <> 'array' or jsonb_array_length(p->'lines') < 2 then raise exception 'القيد الدوري يحتاج سطرين على الأقل'; end if;
+  select coalesce(sum((x->>'debit')::numeric),0), coalesce(sum((x->>'credit')::numeric),0) into dr, cr from jsonb_array_elements(p->'lines') x;
+  if abs(dr - cr) > 0.005 or dr <= 0 then raise exception 'القيد الدوري غير متزن (مدين % / دائن %)', dr, cr; end if;
+  if coalesce(trim(p->>'name'),'') = '' then raise exception 'اسم القيد الدوري مطلوب'; end if;
+  if rid is null then insert into acc.recurring (tenant_id, entity_id, name, every, next_date, end_date, memo, lines, active, created_by) values (t, e, trim(p->>'name'), coalesce(p->>'every','month'), (p->>'next_date')::date, nullif(p->>'end_date','')::date, coalesce(p->>'memo',''), p->'lines', coalesce((p->>'active')::boolean, true), auth.uid()) returning id into rid;
+  else update acc.recurring set entity_id = e, name = trim(p->>'name'), every = coalesce(p->>'every','month'), next_date = (p->>'next_date')::date, end_date = nullif(p->>'end_date','')::date, memo = coalesce(p->>'memo',''), lines = p->'lines', active = coalesce((p->>'active')::boolean, true) where tenant_id = t and id = rid; end if;
+  perform app.audit('upsert','recurring',rid::text,'قيد دوري: ' || (p->>'name')); return jsonb_build_object('id', rid);
+end $$;
+
+create or replace function public.rec_delete(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('journals','delete');
+begin delete from acc.recurring where tenant_id = t and id = (p->>'id')::uuid and entity_id = any(app.ents()); perform app.audit('delete','recurring',p->>'id','حذف قيد دوري'); return jsonb_build_object('ok', true); end $$;
+
+-- توليد القيود المستحقة كمسودات تمر بدورة الاعتماد المعتادة (لا ترحيل آلي)
+create or replace function public.rec_run(p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('journals','add'); asof date := coalesce(nullif(p->>'asof','')::date, current_date); r acc.recurring; n int := 0; k int; step interval; out jsonb := '[]'::jsonb; j jsonb;
+begin
+  for r in select * from acc.recurring where tenant_id = t and active and next_date <= asof and entity_id = any(app.ents()) order by next_date loop
+    step := case r.every when 'month' then interval '1 month' when 'quarter' then interval '3 months' else interval '1 year' end; k := 0;
+    while r.next_date <= asof and (r.end_date is null or r.next_date <= r.end_date) and k < 36 loop
+      j := public.je_save(jsonb_build_object('entity', r.entity_id, 'date', r.next_date, 'memo', r.name || coalesce(' — ' || nullif(r.memo,''), ''), 'lines', r.lines));
+      out := out || jsonb_build_object('recurring', r.name, 'date', r.next_date, 'journal', j->>'id'); n := n + 1; k := k + 1;
+      r.next_date := (r.next_date + step)::date; r.runs := r.runs + 1;
+    end loop;
+    update acc.recurring set next_date = r.next_date, runs = r.runs, last_run = asof, active = active and (end_date is null or r.next_date <= end_date) where tenant_id = t and id = r.id;
+  end loop;
+  perform app.audit('create','recurring','', 'توليد ' || n || ' قيد دوري حتى ' || asof); return jsonb_build_object('generated', n, 'items', out);
+end $$;
+
+-- قوائم مجمّعة: ميزان المجموعة بأعمدة الكيانات وحذف الحسابات البينية (settings.consol.elim = أكواد الحسابات)
+create or replace function public.rpt_consolidated(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p); el text[]; e uuid; tb jsonb; cols jsonb := '[]'::jsonb; acc_map jsonb := '{}'::jsonb; x jsonb; rows jsonb; diff numeric := 0;
+begin
+  select coalesce(array(select jsonb_array_elements_text(coalesce(settings->'consol'->'elim','[]'::jsonb))), '{}') into el from acc.tenants where id = t;
+  foreach e in array ents loop
+    tb := public.rpt_trial_balance(p || jsonb_build_object('entities', jsonb_build_array(e), 'entity', null));
+    cols := cols || jsonb_build_object('id', e, 'name', (select name from acc.entities where tenant_id = t and id = e));
+    for x in select * from jsonb_array_elements(tb->'rows') loop
+      if not (x->>'is_group')::boolean then
+        acc_map := jsonb_set(acc_map, array[x->>'code'], coalesce(acc_map->(x->>'code'), jsonb_build_object('code', x->>'code', 'name', x->>'name', 'type', x->>'type', 'by', '{}'::jsonb)) || jsonb_build_object('by', coalesce(acc_map->(x->>'code')->'by','{}'::jsonb) || jsonb_build_object(e::text, (x->>'closing')::numeric)));
+      end if;
+    end loop;
+  end loop;
+  select coalesce(jsonb_agg(m order by m->>'code'), '[]') into rows from (select v || jsonb_build_object('total', (select coalesce(sum(value::numeric),0) from jsonb_each_text(v->'by')), 'elim', (v->>'code') = any(el)) m from jsonb_each(acc_map) kv(k, v)) s;
+  select coalesce(sum((m->>'total')::numeric),0) into diff from jsonb_array_elements(rows) m where (m->>'elim')::boolean;
+  return jsonb_build_object('entities', cols, 'rows', rows, 'elim_codes', to_jsonb(el), 'interco_diff', diff, 'balanced', abs(diff) < 0.005);
+end $$;
+
+-- أسعار الصرف وتقييم الأرصدة المفتوحة بالعملة الأجنبية
+create or replace function public.fx_rate_set(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need_sys('settings');
+begin if upper(coalesce(p->>'currency','')) !~ '^[A-Z]{3}$' then raise exception 'رمز العملة 3 أحرف'; end if;
+  insert into acc.fx_rates (tenant_id, currency, date, rate, created_by) values (t, upper(p->>'currency'), (p->>'date')::date, (p->>'rate')::numeric, auth.uid()) on conflict (tenant_id, currency, date) do update set rate = excluded.rate;
+  perform app.audit('upsert','fx_rate',upper(p->>'currency'),'سعر صرف ' || upper(p->>'currency') || ' = ' || (p->>'rate')); return jsonb_build_object('ok', true); end $$;
+create or replace function public.fx_rate_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need(null, null);
+begin return coalesce((select jsonb_agg(jsonb_build_object('currency', currency, 'date', date, 'rate', rate) order by date desc, currency) from (select * from acc.fx_rates where tenant_id = t order by date desc limit 200) x), '[]'::jsonb); end $$;
+
+-- معاينة فروق التقييم (post=true ينشئ قيد تسوية مسودة) — الفواتير غير الدائنة/المدينة فقط
+create or replace function public.fx_reval(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p); asof date := coalesce(nullif(p->>'asof','')::date, current_date); rows jsonb := '[]'::jsonb; i record; nr numeric; paid numeric; bb numeric; fcb numeric; d numeric; tot_ar numeric := 0; tot_ap numeric := 0; j jsonb; ar uuid; ap uuid; gl uuid := nullif(p->>'gain_loss_account','')::uuid; lines jsonb := '[]'::jsonb; e uuid;
+begin
+  for i in select * from acc.invoices where tenant_id = t and entity_id = any(ents) and status = 'issued' and rate <> 1 and kind in ('sales','purchase') order by date loop
+    select rate into nr from acc.fx_rates where tenant_id = t and currency = i.currency and date <= asof order by date desc limit 1; if nr is null then continue; end if;
+    paid := app.inv_paid(t, i.id); bb := i.total_base - paid; if bb <= 0.005 then continue; end if; fcb := bb / i.rate; d := round(fcb * nr - bb, 2);
+    if abs(d) < 0.01 then continue; end if;
+    rows := rows || jsonb_build_object('invoice', i.number, 'id', i.id, 'kind', i.kind, 'currency', i.currency, 'old_rate', i.rate, 'new_rate', nr, 'balance_fc', round(fcb,2), 'balance_base', round(bb,2), 'diff', d);
+    if i.kind = 'sales' then tot_ar := tot_ar + d; else tot_ap := tot_ap + d; end if; e := i.entity_id;
+  end loop;
+  if coalesce((p->>'post')::boolean, false) and jsonb_array_length(rows) > 0 then
+    if gl is null then raise exception 'حدّد حساب أرباح/خسائر فروق العملة (gain_loss_account)'; end if;
+    ar := app.sysacct(t, 'AR'); ap := app.sysacct(t, 'AP');
+    if tot_ar <> 0 then lines := lines || jsonb_build_object('account', ar, 'debit', greatest(tot_ar,0), 'credit', greatest(-tot_ar,0), 'description', 'تقييم عملات - عملاء'); end if;
+    if tot_ap <> 0 then lines := lines || jsonb_build_object('account', ap, 'debit', greatest(-tot_ap,0), 'credit', greatest(tot_ap,0), 'description', 'تقييم عملات - موردون'); end if;
+    lines := lines || jsonb_build_object('account', gl, 'debit', greatest(-(tot_ar - tot_ap),0), 'credit', greatest(tot_ar - tot_ap,0), 'description', 'فروق تقييم العملات');
+    j := public.je_save(jsonb_build_object('entity', coalesce(nullif(p->>'entity','')::uuid, e), 'type', 'ADJ', 'date', asof, 'memo', 'تقييم أرصدة العملات الأجنبية بتاريخ ' || asof, 'lines', lines));
+  end if;
+  return jsonb_build_object('rows', rows, 'ar_diff', tot_ar, 'ap_diff', tot_ap, 'journal', j->>'id');
+end $$;
+
+-- ===== بوابة الذكاء الاصطناعي =====
+create or replace function public.ai_catalog(p jsonb default '{}') returns jsonb language sql stable security definer set search_path = public, app as $$
+  select jsonb_build_object('how', 'استدعِ كل دالة عبر REST: POST /rest/v1/rpc/<fn> بجسم {"p": {...}} مع Authorization: Bearer <token> (سجّل الدخول بمستخدم الذكاء). الصلاحيات تُطبَّق من دور المستخدم.', 'login', 'POST /auth/v1/token?grant_type=password {email: <user>@<company>.accounts.mohkam.app, password}', 'functions', jsonb_build_array(
+    jsonb_build_object('fn','ai_brief','purpose','لقطة شاملة: مؤشرات السلامة والاستثناءات والنقدية والذمم والضريبة','params','{entity?}'),
+    jsonb_build_object('fn','health_check','purpose','مؤشرات سلامة الدفاتر (ميزان، مركز مالي، أعمار، تسلسل، سلسلة التدقيق)','params','{entity?}'),
+    jsonb_build_object('fn','global_find','purpose','بحث شامل برقم/اسم/مبلغ','params','{q}'),
+    jsonb_build_object('fn','rpt_trial_balance','purpose','ميزان المراجعة','params','{from,to,entity?}'),
+    jsonb_build_object('fn','rpt_income','purpose','قائمة الدخل','params','{from,to}'),
+    jsonb_build_object('fn','rpt_balance_sheet','purpose','المركز المالي','params','{to}'),
+    jsonb_build_object('fn','rpt_cashflow','purpose','التدفقات النقدية','params','{from,to}'),
+    jsonb_build_object('fn','rpt_aging','purpose','أعمار الذمم','params','{kind: ar|ap, asof}'),
+    jsonb_build_object('fn','rpt_vat','purpose','إقرار ضريبة القيمة المضافة','params','{from,to}'),
+    jsonb_build_object('fn','rpt_consolidated','purpose','ميزان مجمّع للمجموعة بحذف البينيات','params','{from,to}'),
+    jsonb_build_object('fn','tax_register','purpose','سجل الفواتير الضريبي','params','{side: sales|purchase, from, to, q}'),
+    jsonb_build_object('fn','seq_gaps','purpose','فجوات تسلسل الترقيم','params','{from,to}'),
+    jsonb_build_object('fn','controls_report','purpose','الاستثناءات الرقابية','params','{}'),
+    jsonb_build_object('fn','audit_list','purpose','سجل التدقيق','params','{q,action,limit,offset}'),
+    jsonb_build_object('fn','je_list','purpose','قائمة القيود','params','{q,status,limit,offset}'),
+    jsonb_build_object('fn','inv_list','purpose','قائمة الفواتير','params','{kind,status,q}'),
+    jsonb_build_object('fn','rpt_party_statement','purpose','كشف حساب عميل/مورد','params','{party,from,to}'),
+    jsonb_build_object('fn','budget_vs_actual','purpose','الفعلي مقابل الموازنة','params','{id,to_month}'),
+    jsonb_build_object('fn','att_missing','purpose','مستندات تنقصها مرفقات','params','{}')),
+    'rules', jsonb_build_array('اقرأ فقط ما لم يُطلب غير ذلك صراحةً.', 'لا تُرحِّل ولا تعتمد؛ أنشئ مسودات فقط ودع البشر يعتمدون.', 'اذكر دائمًا رقم المستند ورابط التفاصيل عند الاستشهاد بأي رقم.'));
+$$;
+
+create or replace function public.ai_brief(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare res jsonb := jsonb_build_object('generated_at', now()); x jsonb;
+begin
+  perform app.need(null, null);
+  begin x := public.health_check(p); res := res || jsonb_build_object('health', x, 'health_failed', (select coalesce(jsonb_agg(h->>'label'), '[]') from jsonb_array_elements(x) h where not (h->>'ok')::boolean)); exception when others then res := res || jsonb_build_object('health_error', sqlerrm); end;
+  begin x := public.controls_report(p); res := res || jsonb_build_object('exceptions', (select coalesce(jsonb_agg(i), '[]') from jsonb_array_elements(x->'items') i where (i->>'count')::numeric > 0)); exception when others then null; end;
+  begin res := res || jsonb_build_object('dashboard', public.dashboard(p)); exception when others then null; end;
+  begin res := res || jsonb_build_object('vat_ytd', public.rpt_vat(p || jsonb_build_object('from', date_trunc('year', current_date)::date, 'to', current_date))); exception when others then null; end;
+  begin res := res || jsonb_build_object('missing_attachments', jsonb_array_length(public.att_missing(p))); exception when others then null; end;
+  return res;
 end $$;
 -- ===== sql/090_templates.sql =====
 -- مُولَّد آليًا من db/templates/build_templates.py — لا تُعدَّل يدويًا
