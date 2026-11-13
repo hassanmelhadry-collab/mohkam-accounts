@@ -197,6 +197,20 @@ begin
   (t,'viewer','اطلاع محدود','لوحة التحكم والتقارير فقط', false, '{"dashboard":["view"],"reports":["view"]}', '[]')
   on conflict (tenant_id, id) do nothing;
 end $$;
+-- ===== sql/001b_cfg.sql =====
+-- إعدادات المنصة + بوابة التسجيل العام (تُغلق عند الإطلاق الفعلي)
+create table if not exists app.platform_cfg (key text primary key, value text not null, updated_at timestamptz not null default now());
+alter table app.platform_cfg enable row level security;
+-- يُرفض التسجيل إذا كان signup_closed=1 إلا برمز دعوة صحيح (signup_invite_hash = sha256 للرمز)
+create or replace function app.signup_gate(p jsonb) returns void language plpgsql stable security definer set search_path = public, app as $$
+declare closed text; ih text;
+begin
+  select value into closed from app.platform_cfg where key = 'signup_closed';
+  if coalesce(closed,'0') <> '1' then return; end if;
+  select value into ih from app.platform_cfg where key = 'signup_invite_hash';
+  if ih is not null and ih <> '' and encode(sha256(convert_to(coalesce(p->>'invite',''), 'UTF8')), 'hex') = ih then return; end if;
+  raise exception 'التسجيل العام مغلق — تواصل مع الإدارة للحصول على دعوة';
+end $$;
 -- ===== sql/002_ledger.sql =====
 -- مُحكَم للحسابات — دفتر الأستاذ: شجرة الحسابات، الفترات، القيود، المرفقات (قيد مزدوج بقيود قاعدة البيانات)
 
@@ -1006,6 +1020,7 @@ create or replace function public.register_company(p jsonb) returns jsonb langua
 declare t uuid := gen_random_uuid(); u uuid; c text := lower(trim(coalesce(p->>'code',''))); ip text := app.client_ip(); un text := lower(trim(coalesce(p->>'username',''))); e uuid := gen_random_uuid();
   country text := upper(coalesce(nullif(p->>'country',''), 'SA')); cur text := upper(coalesce(nullif(p->>'currency',''), 'SAR')); tpl text := coalesce(nullif(p->>'template',''), 'general'); fy date := coalesce(nullif(p->>'fy_start','')::date, make_date(extract(year from current_date)::int, 1, 1));
 begin
+  perform app.signup_gate(p);
   if c !~ '^[a-z0-9][a-z0-9-]{2,30}$' then raise exception 'رمز الشركة: 3 إلى 31 حرفًا إنجليزيًا صغيرًا أو أرقامًا أو شرطة'; end if;
   if exists (select 1 from acc.tenants where code = c) then raise exception 'رمز الشركة مستخدم — اختر رمزًا آخر'; end if;
   if coalesce(trim(p->>'name'),'') = '' or un = '' then raise exception 'اسم الشركة واسم الدخول مطلوبان'; end if;
@@ -3062,6 +3077,33 @@ begin
     from acc.journal_lines l join acc.accounts a on a.tenant_id = l.tenant_id and a.id = l.account_id where l.tenant_id = t and l.posted and l.entity_id = any(ents) and a.type in ('revenue','expense');
   return jsonb_build_object('from', df, 'to', dt, 'cmp_from', cf, 'cmp_to', ct, 'pl', pl, 'bs', bs, 'unclosed', un, 'cmp_unclosed', unc);
 end $$;
+-- ===== sql/017_security.sql =====
+-- تشديد أمني: RLS لجدول القوالب + التحكم في التسجيل العام من لوحة المنصة
+alter table app.coa_templates enable row level security;
+
+create or replace function public.platform_signup_set(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare inv text := nullif(trim(coalesce(p->>'invite','')), '');
+begin
+  if not app.is_platform_admin() then raise exception 'للإدارة العليا فقط'; end if;
+  if coalesce((auth.jwt()->>'aal'),'aal1') <> 'aal2' and exists (select 1 from auth.mfa_factors where user_id = auth.uid() and status = 'verified') then raise exception 'يلزم التحقق الثنائي'; end if;
+  insert into app.platform_cfg (key, value) values ('signup_closed', case when coalesce((p->>'closed')::boolean, true) then '1' else '0' end)
+    on conflict (key) do update set value = excluded.value, updated_at = now();
+  if p ? 'invite' then
+    if inv is not null and length(inv) < 8 then raise exception 'رمز الدعوة 8 أحرف على الأقل'; end if;
+    insert into app.platform_cfg (key, value) values ('signup_invite_hash', coalesce(encode(sha256(convert_to(inv, 'UTF8')), 'hex'), ''))
+      on conflict (key) do update set value = excluded.value, updated_at = now();
+  end if;
+  return public.platform_signup_get('{}');
+end $$;
+create or replace function public.platform_signup_get(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+begin
+  if not app.is_platform_admin() then raise exception 'للإدارة العليا فقط'; end if;
+  return jsonb_build_object('closed', coalesce((select value from app.platform_cfg where key='signup_closed'),'0') = '1',
+    'has_invite', coalesce((select value from app.platform_cfg where key='signup_invite_hash'),'') <> '');
+end $$;
+-- حالة التسجيل العلنية (لواجهة الدخول): هل التسجيل مفتوح؟
+create or replace function public.signup_status(p jsonb default '{}') returns jsonb language sql stable security definer set search_path = public, app as $$
+  select jsonb_build_object('closed', coalesce((select value from app.platform_cfg where key='signup_closed'),'0') = '1', 'invite', coalesce((select value from app.platform_cfg where key='signup_invite_hash'),'') <> '') $$;
 -- ===== sql/090_templates.sql =====
 -- مُولَّد آليًا من db/templates/build_templates.py — لا تُعدَّل يدويًا
 create table if not exists app.coa_templates (key text primary key, name text not null, description text not null default '', rows jsonb not null);
@@ -3094,8 +3136,8 @@ end $$;
 -- كل دوال الواجهة (التي تأخذ jsonb) متاحة للمستخدم المسجَّل فقط
 do $$ declare f record; begin
   for f in select p.oid::regprocedure as sig, p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.prokind = 'f' and p.proowner = (select oid from pg_roles where rolname = current_user)
-      and (p.proname in ('login_email','register_company','ingest_journal') or p.pronargs = 0 or p.proargtypes::text = (select oid::text from pg_type where typname = 'jsonb')) loop
-    if f.proname in ('register_company','ingest_journal','login_email') then execute format('grant execute on function %s to anon, authenticated', f.sig);
+      and (p.proname in ('login_email','register_company','ingest_journal','signup_status') or p.pronargs = 0 or p.proargtypes::text = (select oid::text from pg_type where typname = 'jsonb')) loop
+    if f.proname in ('register_company','ingest_journal','login_email','signup_status') then execute format('grant execute on function %s to anon, authenticated', f.sig);
     else execute format('grant execute on function %s to authenticated', f.sig); end if;
   end loop;
 end $$;

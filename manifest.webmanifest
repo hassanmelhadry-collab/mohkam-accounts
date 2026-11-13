@@ -1,1 +1,29 @@
-{"name":"مُحكَم — الحسابات","short_name":"مُحكَم حسابات","description":"نظام محاسبي سحابي: دليل حسابات مرن، قيود وفواتير مرتبطة بالمرفقات، قوائم مالية، إقفال سنوي وبوابة موظف.","start_url":"./index.html","scope":"./","display":"standalone","dir":"rtl","lang":"ar","background_color":"#05101C","theme_color":"#0B3B4A","icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png"},{"src":"icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"},{"src":"icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}]}
+{
+  "id": "./index.html",
+  "name": "مُحكَم — الحسابات",
+  "short_name": "مُحكَم حسابات",
+  "description": "نظام محاسبي سحابي لمجموعة الشركات: قيود وفواتير وتحليل مالي ولوحات تنفيذية وبوابة موظف.",
+  "start_url": "./index.html?source=pwa",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "dir": "rtl",
+  "lang": "ar",
+  "background_color": "#05101C",
+  "theme_color": "#0A1626",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    { "src": "icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "لوحة التحكم", "url": "./index.html#/", "icons": [{ "src": "icon-96.png", "sizes": "96x96" }] },
+    { "name": "التحليل المالي", "url": "./index.html#/analysis/exec", "icons": [{ "src": "icon-96.png", "sizes": "96x96" }] },
+    { "name": "فواتير المبيعات", "url": "./index.html#/invoices/sales", "icons": [{ "src": "icon-96.png", "sizes": "96x96" }] },
+    { "name": "القيود اليومية", "url": "./index.html#/journals", "icons": [{ "src": "icon-96.png", "sizes": "96x96" }] }
+  ]
+}
