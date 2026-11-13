@@ -1,6 +1,6 @@
 import { scenario } from './scenario.js';
 const C = window.ACC_CLOUD || { url: 'https://mltyzkaxfdkbqcfxbrkv.supabase.co', key: 'sb_publishable_7VlBCqOaVLHgmyD4qh2TVw_K0YyZGoJ' };
-const CODE = 'demo', PW = 'Demo@Mohkam2026';
+const CODE = window.__code || 'demo', PW = 'Demo@Mohkam2026';
 const S = window.__demo = { log: [], done: false, err: null };
 const H = (tok) => ({ apikey: C.key, 'Content-Type': 'application/json', Authorization: 'Bearer ' + (tok || C.key) });
 const raw = async (fn, p, tok) => { const r = await fetch(C.url + '/rest/v1/rpc/' + fn, { method: 'POST', headers: H(tok), body: JSON.stringify({ p: p || {} }) }); const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = t; } if (!r.ok) throw new Error((j && j.message) || t); return j; };
