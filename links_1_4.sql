@@ -55,3 +55,15 @@ end $$;
 revoke all on function public.demo_link_create(jsonb), public.demo_link_open(jsonb), public.demo_links_list(jsonb), public.demo_link_revoke(jsonb) from public, anon;
 grant execute on function public.demo_link_create(jsonb), public.demo_links_list(jsonb), public.demo_link_revoke(jsonb) to authenticated;
 grant execute on function public.demo_link_open(jsonb) to anon, authenticated;
+create or replace function public.demo_link_delete(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare l acc.demo_links;
+begin
+  perform app.demo_admin();
+  select * into l from acc.demo_links where token = p->>'token';
+  if l.token is null then raise exception 'الرابط غير موجود'; end if;
+  if exists (select 1 from acc.tenants where code = l.code and settings ? 'demo') then perform app.demo_wipe(l.code); end if;
+  delete from acc.demo_links where token = l.token;
+  return jsonb_build_object('ok', true);
+end $$;
+revoke all on function public.demo_link_delete(jsonb) from public, anon;
+grant execute on function public.demo_link_delete(jsonb) to authenticated;
