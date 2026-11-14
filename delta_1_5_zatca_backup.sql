@@ -150,6 +150,13 @@ do $$ declare f record; begin
     else execute format('grant execute on function %s to authenticated', f.sig); end if;
   end loop;
 end $$;
+-- إغلاق وصول غير المسجَّل: لا يبقى متاحًا للزائر إلا دوال الدخول/التسجيل/الديمو/الاستقبال
+do $$ declare f record; begin
+  for f in select p.oid::regprocedure as sig from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.prokind = 'f' and p.proowner = (select oid from pg_roles where rolname = current_user)
+      and (p.pronargs = 0 or p.proargtypes::text = (select oid::text from pg_type where typname = 'jsonb')) and p.proname not in ('login_email','register_company','ingest_journal','signup_status','demo_link_open') loop
+    execute format('revoke execute on function %s from public, anon', f.sig);
+  end loop;
+end $$;
 alter default privileges in schema public revoke execute on functions from public, anon;
 
 notify pgrst, 'reload schema';
