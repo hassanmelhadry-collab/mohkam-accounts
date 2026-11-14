@@ -477,6 +477,56 @@ begin
 end $$;
 
 -- الشركات القائمة تبقى مقفولة عن المزايا الجديدة حتى يفتحها البائع من «المزايا والعقد»؛ الشركات الجديدة تأخذها حسب العقد
+-- ===== 043_alerts =====
+-- مُحكَم للحسابات 1.6 — التنبيهات (الجرس): قراءة فقط، تُحسب لحظيًا من بيانات الشركة وبحسب صلاحيات المستخدم
+-- كل عنصر: k مفتاح ثابت يتضمن العدد (إن تغيّر العدد يعود غير مقروء)، sev: urgent|warn|info، to مسار الصفحة
+create or replace function public.alerts_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need(null, null); ents uuid[] := app.ents(); d date := current_date; r jsonb := '[]'::jsonb; n bigint; s numeric; ex date;
+begin
+  if app.can('journals', 'approve') then
+    select count(*) into n from acc.journals where tenant_id = t and entity_id = any(ents) and status = 'pending';
+    if n > 0 then r := r || jsonb_build_object('k', 'j-pend:' || n, 'sev', 'warn', 'i', 'BookOpen', 't', n || ' قيد بانتظار الاعتماد', 's', 'راجعها واعتمدها أو أعدها لمُعدّها', 'to', '/journals'); end if;
+  end if;
+  if app.can('sales', 'approve') then
+    select count(*) into n from acc.invoices where tenant_id = t and entity_id = any(ents) and status = 'pending' and kind in ('sales','sales_credit');
+    if n > 0 then r := r || jsonb_build_object('k', 'si-pend:' || n, 'sev', 'warn', 'i', 'FileText', 't', n || ' فاتورة/إشعار مبيعات بانتظار الاعتماد', 's', 'من صفحة فواتير المبيعات', 'to', '/invoices/sales'); end if;
+  end if;
+  if app.can('purchases', 'approve') then
+    select count(*) into n from acc.invoices where tenant_id = t and entity_id = any(ents) and status = 'pending' and kind in ('purchase','purchase_debit');
+    if n > 0 then r := r || jsonb_build_object('k', 'pi-pend:' || n, 'sev', 'warn', 'i', 'FileText', 't', n || ' فاتورة/إشعار مشتريات بانتظار الاعتماد', 's', 'من صفحة فواتير المشتريات', 'to', '/invoices/purchase'); end if;
+  end if;
+  if app.can('payments', 'approve') then
+    select count(*) into n from acc.payments where tenant_id = t and entity_id = any(ents) and status = 'pending';
+    if n > 0 then r := r || jsonb_build_object('k', 'pay-pend:' || n, 'sev', 'warn', 'i', 'Banknote', 't', n || ' سند قبض/صرف بانتظار الاعتماد', 's', 'راجعها واعتمدها', 'to', '/payments/receipt'); end if;
+  end if;
+  if app.can('sales', 'view') then
+    select count(*), coalesce(sum(i.total_base - app.inv_paid(t, i.id)), 0) into n, s from acc.invoices i where i.tenant_id = t and i.entity_id = any(ents) and i.kind = 'sales' and i.status = 'issued' and i.due_date < d and i.total_base > app.inv_paid(t, i.id);
+    if n > 0 then r := r || jsonb_build_object('k', 'ar-over:' || n || ':' || round(s), 'sev', 'urgent', 'i', 'AlertCircle', 't', n || ' فاتورة مبيعات متأخرة السداد', 's', 'إجمالي المتأخر ' || to_char(round(s), 'FM999,999,999,990'), 'to', '/reports'); end if;
+  end if;
+  if app.can('purchases', 'view') then
+    select count(*), coalesce(sum(i.total_base - app.inv_paid(t, i.id)), 0) into n, s from acc.invoices i where i.tenant_id = t and i.entity_id = any(ents) and i.kind = 'purchase' and i.status = 'issued' and i.due_date <= d + 7 and i.total_base > app.inv_paid(t, i.id);
+    if n > 0 then r := r || jsonb_build_object('k', 'ap-due:' || n || ':' || round(s), 'sev', 'warn', 'i', 'CalendarClock', 't', n || ' فاتورة مورّد مستحقة خلال 7 أيام أو متأخرة', 's', 'الإجمالي ' || to_char(round(s), 'FM999,999,999,990'), 'to', '/reports'); end if;
+  end if;
+  if app.can('bank', 'view') then
+    select count(*) into n from acc.bank_lines x where x.tenant_id = t and x.matched_line_id is null;
+    if n > 0 then r := r || jsonb_build_object('k', 'bank-un:' || n, 'sev', 'info', 'i', 'Landmark', 't', n || ' حركة بنكية غير مطابقة', 's', 'طابقها مع القيود من صفحة البنوك', 'to', '/bank'); end if;
+  end if;
+  if app.can('requests', 'approve') then
+    select count(*) into n from acc.requests where tenant_id = t and entity_id = any(ents) and status = 'submitted';
+    if n > 0 then r := r || jsonb_build_object('k', 'req:' || n, 'sev', 'warn', 'i', 'Inbox', 't', n || ' طلب موظف بانتظار القرار', 's', 'من صندوق الطلبات', 'to', '/requests'); end if;
+  end if;
+  if app.feat_on('cheques') and app.can('payments', 'view') then
+    select count(*) into n from acc.payments pm where pm.tenant_id = t and pm.entity_id = any(ents) and pm.method = 'cheque' and pm.status = 'posted' and pm.cheque_date < d
+      and not exists (select 1 from acc.cheque_events e where e.tenant_id = t and e.payment_id = pm.id);
+    if n > 0 then r := r || jsonb_build_object('k', 'chq-over:' || n, 'sev', 'warn', 'i', 'FileCheck2', 't', n || ' شيك حلّ استحقاقه ولم يُتابَع', 's', 'حدّث حالته في سجل الشيكات', 'to', '/cheques'); end if;
+  end if;
+  if app.sys('settings') then
+    select expires_at::date into ex from acc.tenants where id = t;
+    if ex is not null and ex - d between 0 and 30 then r := r || jsonb_build_object('k', 'sub:' || ex, 'sev', case when ex - d <= 7 then 'urgent' else 'warn' end, 'i', 'Clock', 't', 'ينتهي اشتراك الشركة خلال ' || (ex - d) || ' يومًا', 's', 'بتاريخ ' || ex || ' — تواصل مع البائع للتجديد', 'to', '/settings'); end if;
+  end if;
+  return r;
+end $$;
+
 do $$ begin
   if not exists (select 1 from app.schema_migrations where version = '1.6.0.1') then  -- مرة واحدة فقط حتى لا يُعاد قفل ما فتحه البائع
     update acc.tenants set features_off = (select coalesce(array_agg(distinct k), '{}') from unnest(coalesce(features_off, '{}') || array['deferrals','warehouses','cheques','custody']) k)  where not (coalesce(settings, '{}'::jsonb) ? 'demo') and created_at < now();
