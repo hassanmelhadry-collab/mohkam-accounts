@@ -131,7 +131,7 @@ create trigger zatca_guard before update or delete on acc.zatca_docs for each ro
 
 -- مُحكَم للحسابات — نسخة احتياطية كاملة لبيانات الشركة (قراءة فقط) لمن يملك صلاحية «نسخ احتياطي»
 -- تُرجع كل جداول الشركة بصيغة JSON. لا تشمل مفاتيح الـAPI ولا روابط الديمو. ملفات المرفقات نفسها في Storage وتُنسخ بسكربت النسخ الشامل.
-create or replace function public.backup_export(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+create or replace function public.backup_export(p jsonb default '{}') returns jsonb language plpgsql volatile security definer set search_path = public, app, acc as $$
 declare t uuid := app.need_sys('backup'); r jsonb := '{}'::jsonb; x record; j jsonb; n jsonb := '{}'::jsonb; c bigint;
 begin
   for x in select tb.table_name from information_schema.tables tb join information_schema.columns c on c.table_schema = tb.table_schema and c.table_name = tb.table_name and c.column_name = 'tenant_id'
