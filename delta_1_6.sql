@@ -527,9 +527,181 @@ begin
   return r;
 end $$;
 
+-- ===== 044_tax_rates =====
+-- مُحكَم للحسابات 1.6 — نسب ضريبة بتاريخ سريان (مثلاً تغيّر نسبة القيمة المضافة)
+-- المبدأ: acc.tax_codes.rate هي النسبة الحالية كما هي. إن وُجدت صفوف في acc.tax_rates يُستعمل آخر صف تاريخ سريانه ≤ تاريخ المستند، وإلا النسبة الحالية.
+-- لا يتغيّر أي مستند سابق (الضريبة تُحسب وتُخزَّن عند الحفظ).
+create table if not exists acc.tax_rates (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, code text not null, effective_from date not null, rate numeric(7,3) not null check (rate >= 0 and rate <= 100), note text not null default '',
+  created_by uuid, created_at timestamptz not null default now(), primary key (tenant_id, code, effective_from), foreign key (tenant_id, code) references acc.tax_codes (tenant_id, code) on delete cascade);
+alter table acc.tax_rates enable row level security;
+
+create or replace function app.tax_rate_on(t uuid, c text, d date, cur numeric) returns numeric language sql stable security definer set search_path = public, acc as $$
+  select coalesce((select r.rate from acc.tax_rates r where r.tenant_id = t and r.code = c and r.effective_from <= d order by r.effective_from desc limit 1), cur) $$;
+
+create or replace function public.tax_rate_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('coa', 'view');
+begin
+  return coalesce((select jsonb_agg(jsonb_build_object('code', r.code, 'effective_from', r.effective_from, 'rate', r.rate, 'note', r.note) order by r.code, r.effective_from desc) from acc.tax_rates r where r.tenant_id = t), '[]'::jsonb);
+end $$;
+
+create or replace function public.tax_rate_set(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need_sys('settings'); c text := p->>'code'; d date := (p->>'effective_from')::date; rt numeric := (p->>'rate')::numeric;
+begin
+  if not exists (select 1 from acc.tax_codes where tenant_id = t and code = c) then raise exception 'رمز ضريبة غير موجود'; end if;
+  if d is null or rt is null or rt < 0 or rt > 100 then raise exception 'التاريخ والنسبة (0–100) مطلوبان'; end if;
+  insert into acc.tax_rates (tenant_id, code, effective_from, rate, note, created_by) values (t, c, d, rt, coalesce(p->>'note',''), auth.uid())
+  on conflict (tenant_id, code, effective_from) do update set rate = excluded.rate, note = excluded.note;
+  perform app.audit('upsert', 'tax_rate', c, 'نسبة ' || c || ' = ' || rt || '% اعتبارًا من ' || d); return jsonb_build_object('ok', true);
+end $$;
+
+create or replace function public.tax_rate_delete(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need_sys('settings');
+begin
+  delete from acc.tax_rates where tenant_id = t and code = p->>'code' and effective_from = (p->>'effective_from')::date;
+  perform app.audit('delete', 'tax_rate', p->>'code', 'حذف نسبة بتاريخ ' || (p->>'effective_from')); return jsonb_build_object('ok', true);
+end $$;
+
+-- إعادة تعريف inv_save/pay_save: تغيير سطر واحد فقط (النسبة السارية بتاريخ المستند) والباقي كما هو
+create or replace function public.inv_save(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid; v_id uuid := nullif(p->>'id','')::uuid; e uuid := nullif(p->>'entity','')::uuid; k text := p->>'kind'; inv acc.invoices; pid uuid := nullif(p->>'party','')::uuid; pr acc.parties; d date := nullif(p->>'date','')::date;
+  l jsonb; i int := 0; aid uuid; tc acc.tax_codes; q numeric; up numeric; dc numeric; net numeric; tx numeric; sub numeric := 0; disc numeric := 0; taxt numeric := 0; fx numeric := coalesce(nullif(p->>'rate','')::numeric, 1); cur text; tcode text; defk text; itm uuid;
+begin
+  if k not in ('sales','purchase','sales_credit','purchase_debit') then raise exception 'نوع الفاتورة غير صالح'; end if;
+  t := app.need(app.inv_module(k), case when v_id is null then 'add' else 'edit' end);
+  if d is null then raise exception 'تاريخ الفاتورة مطلوب'; end if;
+  select * into pr from acc.parties where tenant_id = t and id = pid; if pr.id is null then raise exception 'اختر العميل/المورد'; end if;
+  if not pr.active then raise exception 'الطرف موقوف'; end if;
+  if k in ('sales','sales_credit') and pr.kind not in ('customer','both') then raise exception 'الطرف المحدد ليس عميلًا'; end if;
+  if k in ('purchase','purchase_debit') and pr.kind not in ('supplier','both') then raise exception 'الطرف المحدد ليس موردًا'; end if;
+  select currency into cur from acc.tenants x where x.id = t;
+  if v_id is not null then
+    select * into inv from acc.invoices where tenant_id = t and acc.invoices.id = v_id for update;
+    if inv.id is null then raise exception 'الفاتورة غير موجودة'; end if; perform app.entity_ok(t, inv.entity_id);
+    if inv.status <> 'draft' then raise exception 'تُعدَّل المسودات فقط'; end if; e := inv.entity_id; k := inv.kind;
+    delete from acc.invoice_lines where tenant_id = t and invoice_id = v_id;
+  else perform app.entity_ok(t, e); v_id := gen_random_uuid();
+    insert into acc.invoices (tenant_id, id, entity_id, kind, party_id, date, currency, created_by) values (t, v_id, e, k, pid, d, cur, auth.uid()); end if;
+  defk := case when k in ('sales','sales_credit') then 'SALES' else 'PURCHASES' end;
+  for l in select * from jsonb_array_elements(coalesce(p->'lines','[]'::jsonb)) loop
+    i := i + 1; q := coalesce(nullif(l->>'qty','')::numeric, 1); up := coalesce(nullif(l->>'unit_price','')::numeric, 0); dc := coalesce(nullif(l->>'discount','')::numeric, 0);
+    if q <= 0 or up < 0 or dc < 0 or dc > q * up then raise exception 'السطر %: كمية/سعر/خصم غير صالح', i; end if;
+    itm := nullif(l->>'item','')::uuid; if itm is not null then perform 1 from acc.items where tenant_id = t and id = itm and active; if not found then raise exception 'السطر %: الصنف غير موجود أو موقوف', i; end if; end if;
+    aid := coalesce(app.acct_id(t, nullif(l->>'account','')), app.acct_id(t, nullif(l->>'account_code','')), case when itm is not null and k in ('purchase','purchase_debit') then (select inv_account_id from acc.items where tenant_id = t and id = itm) end, app.acct_id(t, (select code from acc.accounts where tenant_id = t and system_key = defk)));
+    if aid is null then raise exception 'السطر %: حدّد الحساب (أو اربط الحساب الافتراضي %)', i, defk; end if;
+    tcode := nullif(l->>'tax_code','');
+    net := round(q * up - dc, 2); tx := 0;
+    if tcode is not null then
+      select * into tc from acc.tax_codes where tenant_id = t and code = tcode and active; if tc.code is null then raise exception 'السطر %: رمز الضريبة غير موجود', i; end if;
+      if k in ('sales','sales_credit') and tc.kind not in ('output','zero_out','exempt','oos') then raise exception 'السطر %: رمز ضريبة مشتريات على فاتورة مبيعات', i; end if;
+      if k in ('purchase','purchase_debit') and tc.kind not in ('input','zero_in','exempt','oos') then raise exception 'السطر %: رمز ضريبة مبيعات على فاتورة مشتريات', i; end if;
+      tx := round(net * app.tax_rate_on(t, tc.code, d, tc.rate) / 100, 2);
+    end if;
+    perform app.line_dim_ok(t, nullif(l->>'cost_center','')::uuid, 'cc'); perform app.line_dim_ok(t, nullif(l->>'project','')::uuid, 'project');
+    insert into acc.invoice_lines (tenant_id, invoice_id, line_no, description, qty, unit_price, discount, tax_code, account_id, cost_center_id, project_id, net, tax, item_id)
+    values (t, v_id, i, coalesce(l->>'description',''), q, up, dc, tcode, aid, nullif(l->>'cost_center','')::uuid, nullif(l->>'project','')::uuid, net, tx, itm);
+    sub := sub + net; taxt := taxt + tx; disc := disc + dc;
+  end loop;
+  if i = 0 then raise exception 'أضف بندًا واحدًا على الأقل'; end if;
+  update acc.invoices set party_id = pid, date = d, due_date = coalesce(nullif(p->>'due_date','')::date, d + pr.terms_days), supplier_ref = coalesce(trim(p->>'supplier_ref'), ''), currency = coalesce(nullif(p->>'currency',''), cur), rate = case when coalesce(nullif(p->>'currency',''), cur) = cur then 1 else fx end,
+    subtotal = sub, discount_total = disc, tax_total = taxt, total = sub + taxt, notes = coalesce(p->>'notes',''), terms = coalesce(p->>'terms',''), related_id = nullif(p->>'related_id','')::uuid, updated_at = now() where tenant_id = t and acc.invoices.id = v_id;
+  perform app.audit('save','invoice',v_id::text,'مسودة فاتورة (' || k || ') ' || pr.name || ' — ' || (sub + taxt));
+  return jsonb_build_object('id', v_id, 'total', sub + taxt);
+end $$;
+
+create or replace function public.pay_save(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid; v_id uuid := nullif(p->>'id','')::uuid; e uuid := nullif(p->>'entity','')::uuid; k text := p->>'kind'; pay acc.payments; pid uuid := nullif(p->>'party','')::uuid; amt numeric := round((p->>'amount')::numeric, 2);
+  l jsonb; i int := 0; alloc numeric := 0; direct numeric := 0; inv acc.invoices; aid uuid; tc acc.tax_codes; net numeric; tx numeric; ca acc.accounts; d date := nullif(p->>'date','')::date; onacc numeric;
+begin
+  if k not in ('receipt','payment') then raise exception 'نوع السند غير صالح'; end if;
+  t := app.need('payments', case when v_id is null then 'add' else 'edit' end);
+  if d is null or amt is null or amt <= 0 then raise exception 'التاريخ والمبلغ مطلوبان'; end if;
+  select * into ca from acc.accounts where tenant_id = t and id = app.acct_id(t, coalesce(nullif(p->>'cash_account',''), '')); if ca.id is null or ca.subtype not in ('cash','bank','general') or ca.is_group or ca.type <> 'asset' then raise exception 'اختر حساب الصندوق/البنك'; end if;
+  if pid is not null then perform app.line_party_ok(t, pid); end if;
+  if v_id is not null then
+    select * into pay from acc.payments where tenant_id = t and acc.payments.id = v_id for update; if pay.id is null then raise exception 'السند غير موجود'; end if; perform app.entity_ok(t, pay.entity_id);
+    if pay.status <> 'draft' then raise exception 'تُعدَّل المسودات فقط'; end if; e := pay.entity_id; k := pay.kind;
+    delete from acc.payment_lines where tenant_id = t and payment_id = v_id; delete from acc.allocations where tenant_id = t and source_kind = 'payment' and source_id = v_id;
+  else perform app.entity_ok(t, e); v_id := gen_random_uuid();
+    insert into acc.payments (tenant_id, id, entity_id, kind, date, cash_account_id, amount, created_by) values (t, v_id, e, k, d, ca.id, amt, auth.uid()); end if;
+  for l in select * from jsonb_array_elements(coalesce(p->'allocations','[]'::jsonb)) loop
+    if pid is null then raise exception 'حدّد الطرف لتسوية الفواتير'; end if;
+    select * into inv from acc.invoices where tenant_id = t and id = (l->>'invoice')::uuid;
+    if inv.id is null or inv.party_id <> pid or inv.entity_id <> e or inv.status <> 'issued' or (k = 'receipt' and inv.kind <> 'sales') or (k = 'payment' and inv.kind <> 'purchase') then raise exception 'فاتورة غير صالحة للتسوية'; end if;
+    if (l->>'amount')::numeric <= 0 then raise exception 'مبلغ تسوية غير صالح'; end if;
+    insert into acc.allocations (tenant_id, entity_id, source_kind, source_id, invoice_id, amount, date, active, created_by) values (t, e, 'payment', v_id, inv.id, round((l->>'amount')::numeric, 2), d, false, auth.uid());
+    alloc := alloc + round((l->>'amount')::numeric, 2);
+  end loop;
+  for l in select * from jsonb_array_elements(coalesce(p->'lines','[]'::jsonb)) loop
+    i := i + 1; aid := coalesce(app.acct_id(t, nullif(l->>'account','')), app.acct_id(t, nullif(l->>'account_code','')));
+    if aid is null then raise exception 'بند %: الحساب غير موجود', i; end if;
+    net := round((l->>'amount')::numeric, 2); tx := 0;
+    if nullif(l->>'tax_code','') is not null then
+      select * into tc from acc.tax_codes where tenant_id = t and code = l->>'tax_code' and active; if tc.code is null then raise exception 'بند %: رمز الضريبة غير موجود', i; end if;
+      tx := round(net * app.tax_rate_on(t, tc.code, d, tc.rate) / 100, 2);
+    end if;
+    insert into acc.payment_lines (tenant_id, payment_id, line_no, account_id, description, amount, tax_code, tax, cost_center_id, project_id)
+    values (t, v_id, i, aid, coalesce(l->>'description',''), net, nullif(l->>'tax_code',''), tx, nullif(l->>'cost_center','')::uuid, nullif(l->>'project','')::uuid);
+    direct := direct + net + tx;
+  end loop;
+  onacc := amt - alloc - direct;
+  if onacc < 0 then raise exception 'مجموع التسويات والبنود (%) يتجاوز مبلغ السند (%)', alloc + direct, amt; end if;
+  if onacc > 0 and pid is null then raise exception 'المبلغ المتبقي % بلا طرف — حدّد العميل/المورد أو وزّعه على بنود', onacc; end if;
+  update acc.payments set date = d, party_id = pid, method = coalesce(nullif(p->>'method',''), 'bank'), cash_account_id = ca.id, amount = amt, on_account = onacc, reference = coalesce(p->>'reference',''),
+    cheque_no = coalesce(p->>'cheque_no',''), cheque_date = nullif(p->>'cheque_date','')::date, notes = coalesce(p->>'notes',''), updated_at = now() where tenant_id = t and acc.payments.id = v_id;
+  perform app.audit('save','payment',v_id::text,'مسودة سند ' || k || ' — ' || amt);
+  return jsonb_build_object('id', v_id, 'on_account', onacc);
+end $$;
+
+
+-- ===== 045_collections =====
+-- مُحكَم للحسابات 1.6 — متابعة التحصيل: سجل اتصالات ووعود سداد على الفواتير المتأخرة، مع أولوية المتابعة
+create table if not exists acc.collection_notes (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, id uuid not null default gen_random_uuid(), party_id uuid not null, invoice_id uuid,
+  kind text not null check (kind in ('call','visit','message','promise','dispute','note')), date date not null default current_date, promise_date date, promise_amount numeric(18,2) check (promise_amount is null or promise_amount > 0),
+  note text not null default '', created_by uuid, created_at timestamptz not null default now(),
+  primary key (tenant_id, id), foreign key (tenant_id, party_id) references acc.parties (tenant_id, id), foreign key (tenant_id, invoice_id) references acc.invoices (tenant_id, id));
+create index if not exists coll_party on acc.collection_notes (tenant_id, party_id, created_at desc);
+alter table acc.collection_notes enable row level security;
+insert into app.feature_cat (key, name, grp, core, since, sort) values ('collections', 'متابعة التحصيل ووعود السداد', 'المالية', false, 1, 29)
+on conflict (key) do update set name = excluded.name, grp = excluded.grp, core = excluded.core, sort = excluded.sort;
+
+-- العملاء المتأخرون: المتأخر، أقدم تأخير، آخر متابعة، وعد السداد الأحدث (ومخلَف إن فات ولم يُسدَّد)
+create or replace function public.collections_board(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'view'); ents uuid[] := app.pick_ents(p);
+begin
+  if not app.feat_on('collections') then raise exception 'الميزة غير مفعّلة لشركتك'; end if;
+  return coalesce((select jsonb_agg(x order by (x->>'overdue')::numeric desc) from (
+    select jsonb_build_object('party', q.party_id, 'name', pa.name, 'phone', pa.phone, 'invoices', q.n, 'overdue', q.amt, 'oldest_days', current_date - q.oldest,
+      'last_note', (select jsonb_build_object('kind', c.kind, 'date', c.date, 'note', c.note) from acc.collection_notes c where c.tenant_id = t and c.party_id = q.party_id order by c.created_at desc limit 1),
+      'promise', (select jsonb_build_object('date', c.promise_date, 'amount', c.promise_amount, 'broken', c.promise_date < current_date) from acc.collection_notes c where c.tenant_id = t and c.party_id = q.party_id and c.kind = 'promise' and c.promise_date is not null order by c.created_at desc limit 1)) x
+    from (select i.party_id, count(*) n, sum(i.total_base - app.inv_paid(t, i.id)) amt, min(i.due_date) oldest from acc.invoices i where i.tenant_id = t and i.entity_id = any(ents) and i.kind = 'sales' and i.status = 'issued' and i.due_date < current_date and i.total_base > app.inv_paid(t, i.id) group by i.party_id) q
+    join acc.parties pa on pa.tenant_id = t and pa.id = q.party_id) z), '[]'::jsonb);
+end $$;
+
+create or replace function public.collection_note_add(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'edit'); nid uuid := gen_random_uuid(); k text := coalesce(p->>'kind', 'note'); pd date := nullif(p->>'promise_date','')::date; pa numeric := nullif(p->>'promise_amount','')::numeric;
+begin
+  if not app.feat_on('collections') then raise exception 'الميزة غير مفعّلة لشركتك'; end if;
+  if not exists (select 1 from acc.parties where tenant_id = t and id = (p->>'party')::uuid) then raise exception 'العميل غير موجود'; end if;
+  if nullif(p->>'invoice','') is not null and not exists (select 1 from acc.invoices where tenant_id = t and id = (p->>'invoice')::uuid and party_id = (p->>'party')::uuid and entity_id = any(app.ents())) then raise exception 'الفاتورة لا تخص هذا العميل'; end if;
+  if k = 'promise' and (pd is null or pd < current_date - 1) then raise exception 'وعد السداد يحتاج تاريخًا مستقبليًا'; end if;
+  if k = 'note' and nullif(trim(p->>'note'),'') is null then raise exception 'اكتب الملاحظة'; end if;
+  insert into acc.collection_notes (tenant_id, id, party_id, invoice_id, kind, date, promise_date, promise_amount, note, created_by) values (t, nid, (p->>'party')::uuid, nullif(p->>'invoice','')::uuid, k, coalesce(nullif(p->>'date','')::date, current_date), pd, pa, coalesce(p->>'note',''), auth.uid());
+  perform app.audit('create', 'collection_note', nid::text, 'متابعة تحصيل: ' || k); return jsonb_build_object('id', nid);
+end $$;
+
+create or replace function public.collection_notes_list(p jsonb) returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'view');
+begin
+  if not app.feat_on('collections') then raise exception 'الميزة غير مفعّلة لشركتك'; end if;
+  return coalesce((select jsonb_agg(to_jsonb(c) - 'tenant_id' || jsonb_build_object('by', (select name from acc.members m where m.tenant_id = t and m.user_id = c.created_by)) order by c.created_at desc)
+    from acc.collection_notes c where c.tenant_id = t and c.party_id = (p->>'party')::uuid), '[]'::jsonb);
+end $$;
+
 do $$ begin
   if not exists (select 1 from app.schema_migrations where version = '1.6.0.1') then  -- مرة واحدة فقط حتى لا يُعاد قفل ما فتحه البائع
-    update acc.tenants set features_off = (select coalesce(array_agg(distinct k), '{}') from unnest(coalesce(features_off, '{}') || array['deferrals','warehouses','cheques','custody']) k)  where not (coalesce(settings, '{}'::jsonb) ? 'demo') and created_at < now();
+    update acc.tenants set features_off = (select coalesce(array_agg(distinct k), '{}') from unnest(coalesce(features_off, '{}') || array['deferrals','warehouses','cheques','custody','collections']) k)  where not (coalesce(settings, '{}'::jsonb) ? 'demo') and created_at < now();
   end if;
 end $$;
 insert into app.schema_migrations (version, name) values ('1.6.0.1', 'تدقيق قبل/بعد، تعارض مهام، قوالب أدوار، إطفاء، مستودعات وجرد، شيكات، عُهد') on conflict (version) do nothing;
