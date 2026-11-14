@@ -5215,6 +5215,197 @@ begin
   return coalesce((select jsonb_agg(to_jsonb(c) - 'tenant_id' || jsonb_build_object('by', (select name from acc.members m where m.tenant_id = t and m.user_id = c.created_by)) order by c.created_at desc)
     from acc.collection_notes c where c.tenant_id = t and c.party_id = (p->>'party')::uuid), '[]'::jsonb);
 end $$;
+-- ===== sql/046_advances.sql =====
+-- مُحكَم للحسابات 1.6 — الدفعات المقدمة (على الحساب) لكل طرف: عرضها وتطبيقها لاحقًا على فواتير مستحقة
+-- الدفعة «على الحساب» مسجّلة أصلًا في حساب الطرف بقيد الدفعة؛ التطبيق هنا تسوية تفصيلية فقط (لا قيد جديد) تنشئ تخصيصًا في acc.allocations.
+create table if not exists acc.advance_applications (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, id uuid not null default gen_random_uuid(), payment_id uuid not null, invoice_id uuid not null, allocation_id uuid not null,
+  amount numeric(18,2) not null check (amount > 0), date date not null, created_by uuid, created_at timestamptz not null default now(),
+  primary key (tenant_id, id), foreign key (tenant_id, payment_id) references acc.payments (tenant_id, id), foreign key (tenant_id, invoice_id) references acc.invoices (tenant_id, id));
+alter table acc.advance_applications enable row level security;
+
+-- المتاح من دفعة = on_account − ما طُبّق منها (للدفعات المرحّلة فقط)
+create or replace function app.advance_free(t uuid, pay uuid) returns numeric language sql stable security definer set search_path = public, acc as $$
+  select coalesce((select on_account from acc.payments where tenant_id = t and id = pay and status = 'posted'), 0) - coalesce((select sum(a.amount) from acc.advance_applications a join acc.allocations al on al.tenant_id = a.tenant_id and al.id = a.allocation_id where a.tenant_id = t and a.payment_id = pay and al.active), 0) $$;
+
+create or replace function public.advance_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('payments', 'view'); ents uuid[] := app.pick_ents(p); pty uuid := nullif(p->>'party','')::uuid;
+begin
+  return coalesce((select jsonb_agg(x order by x->>'date' desc) from (
+    select jsonb_build_object('payment', pm.id, 'number', pm.number, 'kind', pm.kind, 'date', pm.date, 'party', pm.party_id, 'party_name', pa.name, 'on_account', pm.on_account, 'free', app.advance_free(t, pm.id)) x
+    from acc.payments pm join acc.parties pa on pa.tenant_id = t and pa.id = pm.party_id
+    where pm.tenant_id = t and pm.entity_id = any(ents) and pm.status = 'posted' and pm.on_account > 0 and (pty is null or pm.party_id = pty) and app.advance_free(t, pm.id) > 0) q), '[]'::jsonb);
+end $$;
+
+create or replace function public.advance_apply(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('payments', 'post'); pm acc.payments; inv acc.invoices; amt numeric := round((p->>'amount')::numeric, 2); d date := coalesce(nullif(p->>'date','')::date, current_date); aid uuid := gen_random_uuid(); free numeric;
+begin
+  select * into pm from acc.payments where tenant_id = t and id = (p->>'payment')::uuid and entity_id = any(app.ents()) for update;
+  select * into inv from acc.invoices where tenant_id = t and id = (p->>'invoice')::uuid and entity_id = any(app.ents()) for update;
+  if pm.id is null or inv.id is null then raise exception 'الدفعة أو الفاتورة غير موجودة'; end if;
+  if pm.status <> 'posted' then raise exception 'الدفعة غير مرحّلة'; end if;
+  if inv.status <> 'issued' or inv.party_id <> pm.party_id or inv.entity_id <> pm.entity_id then raise exception 'الفاتورة يجب أن تكون صادرة ولنفس الطرف والشركة'; end if;
+  if (pm.kind = 'receipt' and inv.kind <> 'sales') or (pm.kind = 'payment' and inv.kind <> 'purchase') then raise exception 'نوع الفاتورة لا يطابق نوع الدفعة'; end if;
+  if amt is null or amt <= 0 then raise exception 'المبلغ غير صالح'; end if;
+  free := app.advance_free(t, pm.id);
+  if amt > free then raise exception 'المبلغ يتجاوز المتاح من الدفعة (%)', free; end if;
+  if amt > inv.total_base - app.inv_paid(t, inv.id) then raise exception 'المبلغ يتجاوز رصيد الفاتورة المفتوح'; end if;
+  insert into acc.allocations (tenant_id, id, entity_id, source_kind, source_id, invoice_id, amount, date, active, created_by) values (t, aid, pm.entity_id, 'payment', pm.id, inv.id, amt, d, true, auth.uid());
+  insert into acc.advance_applications (tenant_id, payment_id, invoice_id, allocation_id, amount, date, created_by) values (t, pm.id, inv.id, aid, amt, d, auth.uid());
+  perform app.audit('update', 'advance', pm.id::text, 'تطبيق دفعة مقدمة ' || coalesce(pm.number, '') || ' على فاتورة ' || coalesce(inv.number, '') || ' بمبلغ ' || amt);
+  return jsonb_build_object('allocation', aid, 'free', free - amt);
+end $$;
+
+create or replace function public.advance_unapply(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('payments', 'post'); a acc.advance_applications;
+begin
+  select * into a from acc.advance_applications where tenant_id = t and id = (p->>'id')::uuid;
+  if a.id is null or not exists (select 1 from acc.payments where tenant_id = t and id = a.payment_id and entity_id = any(app.ents())) then raise exception 'التطبيق غير موجود'; end if;
+  update acc.allocations set active = false where tenant_id = t and id = a.allocation_id;
+  delete from acc.advance_applications where tenant_id = t and id = a.id;
+  perform app.audit('update', 'advance', a.payment_id::text, 'إلغاء تطبيق دفعة مقدمة بمبلغ ' || a.amount); return jsonb_build_object('ok', true);
+end $$;
+-- ===== sql/047_quotes.sql =====
+-- مُحكَم للحسابات 1.6 — عروض الأسعار وأوامر البيع (ميزة اختيارية sales_orders)
+-- مستند غير محاسبي (لا قيود): عرض سعر ← أمر بيع ← فاتورة مبيعات مسودة عبر inv_save المعتمدة (فتمرّ بكل ضوابطها). الإجماليات تُحسب في الخادم بنسبة الضريبة السارية.
+create table if not exists acc.quotes (
+  tenant_id uuid not null references acc.tenants(id) on delete cascade, id uuid not null default gen_random_uuid(), entity_id uuid not null, kind text not null check (kind in ('quote','order')),
+  number bigint, date date not null, valid_until date, party_id uuid not null, lines jsonb not null, subtotal numeric(18,2) not null default 0, tax_total numeric(18,2) not null default 0, total numeric(18,2) not null default 0,
+  status text not null default 'draft' check (status in ('draft','sent','accepted','rejected','converted','cancelled')), notes text not null default '', parent_id uuid, invoice_id uuid,
+  created_by uuid, created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+  primary key (tenant_id, id), foreign key (tenant_id, entity_id) references acc.entities (tenant_id, id), foreign key (tenant_id, party_id) references acc.parties (tenant_id, id));
+create index if not exists quotes_q on acc.quotes (tenant_id, entity_id, kind, date desc);
+alter table acc.quotes enable row level security;
+insert into app.feature_cat (key, name, grp, core, since, sort) values ('sales_orders', 'عروض الأسعار وأوامر البيع', 'المبيعات', false, 1, 30)
+on conflict (key) do update set name = excluded.name, grp = excluded.grp, core = excluded.core, sort = excluded.sort;
+
+create or replace function public.quote_save(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', case when nullif(p->>'id','') is null then 'add' else 'edit' end); v uuid := nullif(p->>'id','')::uuid; e uuid := (p->>'entity')::uuid; k text := coalesce(p->>'kind','quote'); d date := coalesce(nullif(p->>'date','')::date, current_date);
+  l jsonb; net numeric; tx numeric; sub numeric := 0; tt numeric := 0; tcode text; tc acc.tax_codes; cur acc.quotes; ls jsonb := '[]'::jsonb; no bigint;
+begin
+  if not app.feat_on('sales_orders') then raise exception 'الميزة غير مفعّلة لشركتك'; end if;
+  if e is null or not (e = any(app.ents())) then raise exception 'كيان غير مسموح'; end if;
+  if k not in ('quote','order') then raise exception 'نوع غير صالح'; end if;
+  if not exists (select 1 from acc.parties where tenant_id = t and id = (p->>'party')::uuid and kind in ('customer','both')) then raise exception 'اختر عميلًا صالحًا'; end if;
+  if jsonb_typeof(p->'lines') <> 'array' or jsonb_array_length(p->'lines') = 0 then raise exception 'أضف سطرًا واحدًا على الأقل'; end if;
+  for l in select * from jsonb_array_elements(p->'lines') loop
+    if coalesce((l->>'qty')::numeric, 0) <= 0 or coalesce((l->>'unit_price')::numeric, -1) < 0 then raise exception 'الكمية والسعر غير صالحين'; end if;
+    net := round((l->>'qty')::numeric * (l->>'unit_price')::numeric - coalesce(nullif(l->>'discount','')::numeric, 0), 2); if net < 0 then raise exception 'الخصم أكبر من قيمة السطر'; end if;
+    tcode := nullif(l->>'tax_code',''); tx := 0;
+    if tcode is not null then select * into tc from acc.tax_codes where tenant_id = t and code = tcode and active; if tc.code is null then raise exception 'رمز ضريبة غير موجود'; end if; tx := round(net * app.tax_rate_on(t, tc.code, d, tc.rate) / 100, 2); end if;
+    sub := sub + net; tt := tt + tx; ls := ls || jsonb_build_array(l || jsonb_build_object('net', net, 'tax', tx));
+  end loop;
+  if v is null then
+    no := app.next_no(t, e, case when k = 'quote' then 'QT' else 'SO' end, extract(year from d)::int);
+    insert into acc.quotes (tenant_id, entity_id, kind, number, date, valid_until, party_id, lines, subtotal, tax_total, total, notes, parent_id, created_by) values (t, e, k, no, d, nullif(p->>'valid_until','')::date, (p->>'party')::uuid, ls, sub, tt, sub + tt, coalesce(p->>'notes',''), nullif(p->>'parent','')::uuid, auth.uid()) returning id into v;
+  else
+    select * into cur from acc.quotes where tenant_id = t and id = v and entity_id = any(app.ents()) for update; if cur.id is null then raise exception 'المستند غير موجود'; end if;
+    if cur.status not in ('draft','sent') then raise exception 'لا يُعدَّل مستند بعد قبوله أو تحويله'; end if;
+    update acc.quotes set date = d, valid_until = nullif(p->>'valid_until','')::date, party_id = (p->>'party')::uuid, lines = ls, subtotal = sub, tax_total = tt, total = sub + tt, notes = coalesce(p->>'notes',''), updated_at = now() where tenant_id = t and id = v;
+  end if;
+  perform app.audit('upsert', 'quote', v::text, case when k = 'quote' then 'عرض سعر ' else 'أمر بيع ' end || sub + tt); return jsonb_build_object('id', v, 'total', sub + tt);
+end $$;
+
+create or replace function public.quote_list(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'view'); ents uuid[] := app.pick_ents(p); k text := nullif(p->>'kind','');
+begin
+  if not app.feat_on('sales_orders') then raise exception 'الميزة غير مفعّلة لشركتك'; end if;
+  return coalesce((select jsonb_agg(to_jsonb(q) - 'tenant_id' - 'lines' || jsonb_build_object('party_name', (select name from acc.parties x where x.tenant_id = t and x.id = q.party_id), 'expired', (q.status in ('draft','sent') and q.valid_until is not null and q.valid_until < current_date)) order by q.date desc, q.number desc)
+    from acc.quotes q where q.tenant_id = t and q.entity_id = any(ents) and (k is null or q.kind = k)), '[]'::jsonb);
+end $$;
+
+create or replace function public.quote_get(p jsonb) returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'view'); q acc.quotes;
+begin
+  select * into q from acc.quotes where tenant_id = t and id = (p->>'id')::uuid and entity_id = any(app.ents()); if q.id is null then raise exception 'المستند غير موجود'; end if;
+  return to_jsonb(q) - 'tenant_id' || jsonb_build_object('party_name', (select name from acc.parties x where x.tenant_id = t and x.id = q.party_id));
+end $$;
+
+create or replace function public.quote_status(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'edit'); q acc.quotes; ns text := p->>'status';
+begin
+  select * into q from acc.quotes where tenant_id = t and id = (p->>'id')::uuid and entity_id = any(app.ents()) for update; if q.id is null then raise exception 'المستند غير موجود'; end if;
+  if not ((q.status = 'draft' and ns in ('sent','cancelled')) or (q.status = 'sent' and ns in ('accepted','rejected','cancelled','draft')) or (q.status = 'accepted' and ns = 'cancelled')) then raise exception 'لا يمكن الانتقال من «%» إلى «%»', q.status, ns; end if;
+  update acc.quotes set status = ns, updated_at = now() where tenant_id = t and id = q.id; perform app.audit('update', 'quote', q.id::text, q.status || ' ← ' || ns); return jsonb_build_object('ok', true);
+end $$;
+
+-- تحويل: عرض مقبول → أمر بيع، أو عرض/أمر مقبول → فاتورة مبيعات مسودة (عبر inv_save فتمرّ بضوابطها ودورة الاعتماد)
+create or replace function public.quote_convert(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare t uuid := app.need('sales', 'add'); q acc.quotes; to_ text := p->>'to'; r jsonb; ls jsonb;
+begin
+  select * into q from acc.quotes where tenant_id = t and id = (p->>'id')::uuid and entity_id = any(app.ents()) for update; if q.id is null then raise exception 'المستند غير موجود'; end if;
+  if q.status <> 'accepted' then raise exception 'يجب أن يكون المستند «مقبولًا» قبل التحويل'; end if;
+  if to_ = 'order' then
+    if q.kind <> 'quote' then raise exception 'التحويل إلى أمر بيع من عرض سعر فقط'; end if;
+    r := public.quote_save(jsonb_build_object('entity', q.entity_id, 'kind', 'order', 'party', q.party_id, 'date', current_date, 'lines', q.lines, 'notes', q.notes, 'parent', q.id));
+    update acc.quotes set status = 'converted', updated_at = now() where tenant_id = t and id = q.id;
+    update acc.quotes set status = 'accepted' where tenant_id = t and id = (r->>'id')::uuid;
+    return r;
+  elsif to_ = 'invoice' then
+    select jsonb_agg(jsonb_build_object('description', x->>'description', 'qty', x->'qty', 'unit_price', x->'unit_price', 'discount', coalesce(x->'discount', '0'::jsonb), 'account', x->>'account', 'tax_code', x->>'tax_code', 'item', x->>'item')) into ls from jsonb_array_elements(q.lines) x;
+    r := public.inv_save(jsonb_build_object('kind', 'sales', 'entity', q.entity_id, 'party', q.party_id, 'date', current_date, 'notes', q.notes, 'lines', ls));
+    update acc.quotes set status = 'converted', invoice_id = (r->>'id')::uuid, updated_at = now() where tenant_id = t and id = q.id;
+    perform app.audit('update', 'quote', q.id::text, 'تحويل إلى فاتورة مبيعات مسودة'); return r;
+  end if;
+  raise exception 'وجهة التحويل غير صالحة';
+end $$;
+-- ===== sql/048_demo_pool.sql =====
+-- مُحكَم للحسابات 1.6.2 — إنشاء رابط الديمو في أقل من ثانية: مخزون جاهز من شركات تجريبية مبذورة مسبقًا
+-- رابط الديمو يحجز شركة جاهزة من المخزون (تسمية فقط) فيصير الإنشاء فوريًا؛ المخزون يُعاد ملؤه في الخلفية. إن فرغ يعمل البذر المباشر كما كان.
+create table if not exists acc.demo_pool (code text primary key, pwd text not null, created_at timestamptz not null default now());
+alter table acc.demo_pool enable row level security;
+
+create or replace function app.demo_cleanup() returns int language plpgsql security definer set search_path = public, app, acc as $$
+declare r record; n int := 0;
+begin
+  for r in select code from acc.tenants where settings ? 'demo' and code <> 'group5' and (settings->'demo'->>'days') is not null and expires_at + 7 < current_date - 30 and code not in (select code from acc.demo_pool) loop
+    perform app.demo_wipe(r.code); n := n + 1; end loop;
+  -- مخزون قديم جدًا (أكثر من 20 يومًا) يُستبدل بجديد
+  for r in select code from acc.demo_pool where created_at < now() - interval '20 days' loop
+    delete from acc.demo_pool where code = r.code; perform app.demo_wipe(r.code); n := n + 1; end loop;
+  return n;
+end $$;
+
+-- ملء المخزون: شركة واحدة في كل استدعاء (تستغرق بضع ثوانٍ؛ تُستدعى من الخلفية). target = العدد المطلوب جاهزًا (1..5)
+create or replace function public.demo_pool_fill(p jsonb default '{}') returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare tg int := least(greatest(coalesce(nullif(p->>'target','')::int, 2), 1), 5); have int; vcode text; vpwd text; alphabet text := 'abcdefghjkmnpqrstuvwxyz23456789'; i int;
+begin
+  perform app.demo_admin();
+  if not pg_try_advisory_xact_lock(7770148) then return jsonb_build_object('ready', (select count(*) from acc.demo_pool), 'busy', true); end if;
+  select count(*) into have from acc.demo_pool;
+  if have < tg then
+    vcode := 'demo-'; for i in 1..5 loop vcode := vcode || substr(alphabet, 1 + floor(random() * length(alphabet))::int, 1); end loop;
+    vpwd := 'Dm'; for i in 1..8 loop vpwd := vpwd || substr(alphabet, 1 + floor(random() * length(alphabet))::int, 1); end loop; vpwd := vpwd || '#7';
+    perform app.demo_seed(vcode, 'نسخة تجريبية', vpwd, 7, '');
+    insert into acc.demo_pool (code, pwd) values (vcode, vpwd); have := have + 1;
+  end if;
+  return jsonb_build_object('ready', have, 'target', tg, 'busy', false);
+end $$;
+
+create or replace function public.demo_link_create(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
+declare nm text := trim(coalesce(p->>'label','')); h int := coalesce(nullif(p->>'hours','')::int, 48); vcode text; vpwd text; tok text; alphabet text := 'abcdefghjkmnpqrstuvwxyz23456789'; i int; pl record; fast boolean := false;
+begin
+  perform app.demo_admin();
+  if nm = '' or length(nm) > 80 then raise exception 'الاسم مطلوب (حتى 80 حرفًا)'; end if;
+  if h not in (24, 48, 72, 168, 336, 720) then raise exception 'المدة: يوم أو يومان أو 3 أيام أو أسبوع أو أسبوعان أو 30 يومًا'; end if;
+  -- حجز شركة جاهزة (تخطّي الصفوف المحجوزة لدى طلب آخر متزامن)
+  for pl in select * from acc.demo_pool order by created_at for update skip locked loop
+    if exists (select 1 from acc.tenants t where t.code = pl.code) then
+      vcode := pl.code; vpwd := pl.pwd; delete from acc.demo_pool where demo_pool.code = pl.code; fast := true; exit;
+    else delete from acc.demo_pool where demo_pool.code = pl.code; end if;
+  end loop;
+  if fast then
+    update acc.tenants set name = 'نسخة تجريبية — ' || nm, settings = jsonb_set(settings, '{demo,for}', to_jsonb(nm)) where acc.tenants.code = vcode;
+  else
+    vcode := 'demo-'; for i in 1..5 loop vcode := vcode || substr(alphabet, 1 + floor(random() * length(alphabet))::int, 1); end loop;
+    vpwd := 'Dm'; for i in 1..8 loop vpwd := vpwd || substr(alphabet, 1 + floor(random() * length(alphabet))::int, 1); end loop; vpwd := vpwd || '#7';
+    perform app.demo_seed(vcode, 'نسخة تجريبية — ' || nm, vpwd, 7, nm);
+  end if;
+  tok := 'k' || substr(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''), 1, 20);
+  insert into acc.demo_links (token, label, hours, code, pwd) values (tok, nm, h, vcode, vpwd);
+  perform app.padmin_log('demo_create', vcode, nm || ' / ' || h || ' ساعة' || case when fast then ' (جاهزة)' else '' end);
+  return jsonb_build_object('token', tok, 'fast', fast);
+end $$;
 -- ===== sql/090_templates.sql =====
 -- مُولَّد آليًا من db/templates/build_templates.py — لا تُعدَّل يدويًا
 create table if not exists app.coa_templates (key text primary key, name text not null, description text not null default '', rows jsonb not null);
