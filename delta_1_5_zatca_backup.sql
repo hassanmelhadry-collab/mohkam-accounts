@@ -1,35 +1,4 @@
--- تحديث 1.5 (إعادة تقييم العملة للإشعارات + تجهيز ZATCA المرحلة الثانية). آمن للتكرار. تجهيز فقط بلا ربط فعلي.
--- مُحكَم للحسابات — إعادة تقييم العملة تشمل الإشعارات الدائنة والمدينة (بالعملة الأجنبية)
--- الإشعار الدائن يخفّض رصيد العملاء، والمدين يخفّض رصيد الموردين؛ فأثر فرق التقييم عليهما عكسي (إشارة −).
--- كما تُنشأ أسطر الذمم في قيد التقييم لكل طرف على حدة (الحسابات الذمّية تشترط تحديد الطرف).
-create or replace function public.fx_reval(p jsonb) returns jsonb language plpgsql security definer set search_path = public, app, acc as $$
-declare t uuid := app.need('reports','view'); ents uuid[] := app.pick_ents(p); asof date := coalesce(nullif(p->>'asof','')::date, current_date); rows jsonb := '[]'::jsonb; i record; nr numeric; paid numeric; bb numeric; fcb numeric; d numeric; sg int;
-  tot_ar numeric := 0; tot_ap numeric := 0; j jsonb; ar uuid; ap uuid; gl uuid := nullif(p->>'gain_loss_account','')::uuid; lines jsonb := '[]'::jsonb; e uuid; pr record; net numeric;
-begin
-  for i in select * from acc.invoices where tenant_id = t and entity_id = any(ents) and status = 'issued' and rate <> 1 and kind in ('sales','purchase','sales_credit','purchase_debit') order by date, created_at loop
-    select rate into nr from acc.fx_rates where tenant_id = t and currency = i.currency and date <= asof order by date desc limit 1; if nr is null then continue; end if;
-    paid := app.inv_paid(t, i.id); bb := i.total_base - paid; if bb <= 0.005 then continue; end if; fcb := bb / i.rate;
-    sg := case when i.kind in ('sales_credit','purchase_debit') then -1 else 1 end;   -- الإشعارات تخفّض رصيد الطرف
-    d := round(sg * (fcb * nr - bb), 2);
-    if abs(d) < 0.01 then continue; end if;
-    rows := rows || jsonb_build_object('invoice', i.number, 'id', i.id, 'kind', i.kind, 'party_id', i.party_id, 'currency', i.currency, 'old_rate', i.rate, 'new_rate', nr, 'balance_fc', round(fcb,2), 'balance_base', round(bb,2), 'diff', d);
-    if i.kind in ('sales','sales_credit') then tot_ar := tot_ar + d; else tot_ap := tot_ap + d; end if; e := i.entity_id;
-  end loop;
-  if coalesce((p->>'post')::boolean, false) and jsonb_array_length(rows) > 0 then
-    if gl is null then raise exception 'حدّد حساب أرباح/خسائر فروق العملة (gain_loss_account)'; end if;
-    ar := app.sysacct(t, 'AR'); ap := app.sysacct(t, 'AP');
-    -- ذمم العملاء: مدين عند الزيادة. ذمم الموردين: دائن عند الزيادة (أي مدين عند النقص)
-    for pr in select x->>'party_id' pid, (x->>'kind') in ('sales','sales_credit') is_ar, sum((x->>'diff')::numeric) d from jsonb_array_elements(rows) x group by 1, 2 having abs(sum((x->>'diff')::numeric)) >= 0.01 loop
-      if pr.is_ar then lines := lines || jsonb_build_object('account', ar, 'party', pr.pid, 'debit', greatest(pr.d,0), 'credit', greatest(-pr.d,0), 'description', 'تقييم عملات - عملاء');
-      else lines := lines || jsonb_build_object('account', ap, 'party', pr.pid, 'debit', greatest(-pr.d,0), 'credit', greatest(pr.d,0), 'description', 'تقييم عملات - موردون'); end if;
-    end loop;
-    net := tot_ar - tot_ap;   -- موجب = ربح فروق عملة (دائن)
-    if abs(net) >= 0.01 then lines := lines || jsonb_build_object('account', gl, 'debit', greatest(-net,0), 'credit', greatest(net,0), 'description', 'فروق تقييم العملات'); end if;
-    j := public.je_save(jsonb_build_object('entity', coalesce(nullif(p->>'entity','')::uuid, e), 'type', 'ADJ', 'date', asof, 'memo', 'تقييم أرصدة العملات الأجنبية بتاريخ ' || asof, 'lines', lines));
-  end if;
-  return jsonb_build_object('rows', rows, 'ar_diff', tot_ar, 'ap_diff', tot_ap, 'journal', j->>'id');
-end $$;
-
+-- 1.5.0.2: ZATCA المرحلة الثانية (تجهيز فقط) + النسخ الاحتياطي. شغّله بعد 01ج. آمن للتكرار.
 -- مُحكَم للحسابات — فاتورة ZATCA المرحلة الثانية: تجهيز فقط (بلا ربط فعلي بمنصة فاتورة)
 -- لكل فاتورة مبيعات/إشعار دائن صادر: UUID، عدّاد التسلسل ICV لكل كيان، سلسلة التجزئة PIH، ومستند UBL 2.1 XML جاهز.
 -- ما لم يُنفَّذ (يلزم عند الربط): توقيع XAdES بشهادة CSID، الختم التشفيري، رمز QR المرحلة الثانية، التطبيع C14N 1.1، الإبلاغ/التصريح عبر API.
@@ -159,3 +128,28 @@ end $$;
 drop trigger if exists zatca_guard on acc.zatca_docs;
 create trigger zatca_guard before update or delete on acc.zatca_docs for each row execute function app.zatca_guard();
 
+
+-- مُحكَم للحسابات — نسخة احتياطية كاملة لبيانات الشركة (قراءة فقط) لمن يملك صلاحية «نسخ احتياطي»
+-- تُرجع كل جداول الشركة بصيغة JSON. لا تشمل مفاتيح الـAPI ولا روابط الديمو. ملفات المرفقات نفسها في Storage وتُنسخ بسكربت النسخ الشامل.
+create or replace function public.backup_export(p jsonb default '{}') returns jsonb language plpgsql stable security definer set search_path = public, app, acc as $$
+declare t uuid := app.need_sys('backup'); r jsonb := '{}'::jsonb; x record; j jsonb; n jsonb := '{}'::jsonb; c bigint;
+begin
+  for x in select tb.table_name from information_schema.tables tb join information_schema.columns c on c.table_schema = tb.table_schema and c.table_name = tb.table_name and c.column_name = 'tenant_id'
+           where tb.table_schema = 'acc' and tb.table_type = 'BASE TABLE' and tb.table_name not in ('api_keys', 'demo_links', 'ingest_log') order by 1 loop
+    execute format('select coalesce(jsonb_agg(to_jsonb(q)), ''[]''::jsonb), count(*) from acc.%I q where q.tenant_id = $1', x.table_name) into j, c using t;
+    r := r || jsonb_build_object(x.table_name, j); n := n || jsonb_build_object(x.table_name, c);
+  end loop;
+  perform app.audit('export', 'backup', t::text, 'تصدير نسخة احتياطية كاملة');
+  return jsonb_build_object('app', 'mohkam-accounts', 'format', 1, 'exported_at', now(), 'tenant_id', t, 'counts', n, 'tables', r);
+end $$;
+
+do $$ declare f record; begin
+  for f in select p.oid::regprocedure as sig, p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.prokind = 'f' and p.proowner = (select oid from pg_roles where rolname = current_user)
+      and (p.proname in ('login_email','register_company','ingest_journal','signup_status','demo_link_open') or p.pronargs = 0 or p.proargtypes::text = (select oid::text from pg_type where typname = 'jsonb')) loop
+    if f.proname in ('register_company','ingest_journal','login_email','signup_status','demo_link_open') then execute format('grant execute on function %s to anon, authenticated', f.sig);
+    else execute format('grant execute on function %s to authenticated', f.sig); end if;
+  end loop;
+end $$;
+alter default privileges in schema public revoke execute on functions from public, anon;
+
+notify pgrst, 'reload schema';
