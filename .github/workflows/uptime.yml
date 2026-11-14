@@ -1,0 +1,24 @@
+name: Uptime monitor
+# فحص توافر كل 10 دقائق: الموقع + الديمو + واجهة قاعدة البيانات. عند الفشل يفشل التشغيل ويصل إشعار GitHub لمالك المستودع.
+on:
+  schedule: [{ cron: '*/10 * * * *' }]
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe
+        run: |
+          set -u
+          fail=0
+          check() { code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' "$2"); echo "$1 → $code"; [ "$code" = "$3" ] || fail=1; }
+          check "الموقع" "https://hassanmelhadry-collab.github.io/mohkam-accounts/" 200
+          check "الديمو" "https://hassanmelhadry-collab.github.io/mohkam-accounts/demo/" 200
+          check "قاعدة البيانات (REST)" "https://mltyzkaxfdkbqcfxbrkv.supabase.co/rest/v1/" 401
+          check "المصادقة" "https://mltyzkaxfdkbqcfxbrkv.supabase.co/auth/v1/health" 401
+          # نداء حقيقي لدالة عامة: يجب أن يعيد 200 من الخادم
+          code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -X POST 'https://mltyzkaxfdkbqcfxbrkv.supabase.co/rest/v1/rpc/signup_status' -H 'apikey: sb_publishable_7VlBCqOaVLHgmyD4qh2TVw_K0YyZGoJ' -H 'Content-Type: application/json' -d '{"p":{}}')
+          echo "نداء RPC → $code"; [ "$code" = "200" ] || fail=1
+          exit $fail
