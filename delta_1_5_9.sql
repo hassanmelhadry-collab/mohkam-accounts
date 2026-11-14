@@ -18,6 +18,7 @@ insert into app.api_ops (op, fn, writes, descr) values
  ('fx.set','fx_rate_set',true,'تسجيل سعر صرف')
 on conflict (op) do update set fn = excluded.fn, writes = excluded.writes, descr = excluded.descr;
 
+alter table app.api_ops enable row level security;  -- مقفل: لا وصول مباشر (البوابة security definer)
 create table if not exists acc.api_rate (key_id uuid not null, minute timestamptz not null, n int not null default 0, primary key (key_id, minute));
 create table if not exists acc.api_idem (key_id uuid not null, idem text not null, result jsonb, at timestamptz not null default now(), primary key (key_id, idem));
 alter table acc.api_rate enable row level security; alter table acc.api_idem enable row level security;
@@ -85,6 +86,7 @@ begin
 end $$;
 -- مُحكَم للحسابات — سجل إصدارات قاعدة البيانات: يعرف مدير المنصة أي تحديث طُبّق، وينبّه إن كان التطبيق أحدث من القاعدة
 create table if not exists app.schema_migrations (version text primary key check (version ~ '^[0-9]+(\.[0-9]+){2,3}$'), name text not null default '', applied_at timestamptz not null default now());
+alter table app.schema_migrations enable row level security;
 insert into app.schema_migrations (version, name) values
   ('1.5.0.5', 'تأمين التخزين + مراقبة الأخطاء'), ('1.5.0.6', 'استرجاع الكوارث'), ('1.5.0.7', 'حماية مدير المنصة + القبول الإلكتروني + أداء التدفقات'),
   ('1.5.0.8', 'إنهاء العقد + الدعم الفني + قائمة التهيئة'), ('1.5.0.9', 'بوابة API الموحّدة + سجل الإصدارات')
