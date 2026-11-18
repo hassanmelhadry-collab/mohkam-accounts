@@ -285,3 +285,7 @@ end $$;
 insert into app.schema_migrations (version, name) values ('1.7.4.0', 'الوثائق المنشورة وقبول المالك والإصدارات'), ('1.8.0.0', 'المراجعة الشاملة والمعايير الدولية: ECL وSAF-T وقائمة حقوق الملكية')
 on conflict (version) do nothing;
 
+
+-- صلاحيات الدوال الجديدة: للمستخدمين المسجّلين فقط (مثل بقية الدوال)
+revoke execute on function public.system_review(jsonb), public.ecl_preview(jsonb), public.ecl_post(jsonb), public.ecl_settings_save(jsonb), public.audit_file(jsonb), public.rpt_equity_changes(jsonb) from public, anon;
+grant execute on function public.system_review(jsonb), public.ecl_preview(jsonb), public.ecl_post(jsonb), public.ecl_settings_save(jsonb), public.audit_file(jsonb), public.rpt_equity_changes(jsonb) to authenticated;
