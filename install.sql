@@ -7764,9 +7764,11 @@ grant execute on function public.share_path_ok(text), public.share_peek(jsonb), 
 do $$ begin
   if exists (select 1 from information_schema.schemata where schema_name = 'storage') then
     insert into storage.buckets (id, name, public, file_size_limit) values ('acc-shares', 'acc-shares', false, 52428800) on conflict (id) do update set public = false, file_size_limit = 52428800;
-    drop policy if exists acc_shares_insert on storage.objects; drop policy if exists acc_shares_read on storage.objects;
+    drop policy if exists acc_shares_insert on storage.objects; drop policy if exists acc_shares_read on storage.objects; drop policy if exists acc_shares_read_link on storage.objects; drop policy if exists acc_shares_read_own on storage.objects;
     create policy acc_shares_insert on storage.objects for insert to authenticated with check (bucket_id = 'acc-shares' and (storage.foldername(name))[1] = public.tenant_folder());
-    create policy acc_shares_read on storage.objects for select to anon, authenticated using (bucket_id = 'acc-shares' and (public.share_path_ok(name) or (storage.foldername(name))[1] = public.tenant_folder()));
+    -- سياستان منفصلتان: الزائر لا يملك صلاحية دالة tenant_folder فلا يجوز أن تظهر في سياسته
+    create policy acc_shares_read_link on storage.objects for select to anon, authenticated using (bucket_id = 'acc-shares' and public.share_path_ok(name));
+    create policy acc_shares_read_own on storage.objects for select to authenticated using (bucket_id = 'acc-shares' and (storage.foldername(name))[1] = public.tenant_folder());
   end if;
 end $$;
 
