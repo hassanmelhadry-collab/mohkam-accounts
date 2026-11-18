@@ -289,3 +289,6 @@ on conflict (version) do nothing;
 -- صلاحيات الدوال الجديدة: للمستخدمين المسجّلين فقط (مثل بقية الدوال)
 revoke execute on function public.system_review(jsonb), public.ecl_preview(jsonb), public.ecl_post(jsonb), public.ecl_settings_save(jsonb), public.audit_file(jsonb), public.rpt_equity_changes(jsonb) from public, anon;
 grant execute on function public.system_review(jsonb), public.ecl_preview(jsonb), public.ecl_post(jsonb), public.ecl_settings_save(jsonb), public.audit_file(jsonb), public.rpt_equity_changes(jsonb) to authenticated;
+
+insert into app.schema_migrations (version, name) values ('1.8.0.1', 'واجهة فقط: إصلاح عرض شرائح الخسائر الائتمانية')
+on conflict (version) do nothing;
