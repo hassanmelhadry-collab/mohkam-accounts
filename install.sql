@@ -7641,6 +7641,10 @@ grant execute on function public.att_hold(jsonb), public.retention_save(jsonb), 
 
 insert into app.schema_migrations (version, name) values ('1.9.0.0', 'مكتبة المعايير + سدّ ثغرة حذف التخزين + التجميد القانوني والاحتفاظ + محادثة الطلبات + كشف الموظف')
 on conflict (version) do nothing;
+-- ===== sql/076_version_1901.sql =====
+-- مُحكَم للحسابات 1.9.0.1 — إعادة تنظيم القائمة الجانبية (واجهة فقط)
+insert into app.schema_migrations (version, name) values ('1.9.0.1', 'إعادة تنظيم القائمة الجانبية حسب مسار العمل (13 مجموعة) — واجهة فقط')
+on conflict (version) do nothing;
 -- ===== sql/090_templates.sql =====
 -- مُولَّد آليًا من db/templates/build_templates.py — لا تُعدَّل يدويًا
 create table if not exists app.coa_templates (key text primary key, name text not null, description text not null default '', rows jsonb not null);
