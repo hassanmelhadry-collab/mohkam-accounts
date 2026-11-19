@@ -208,3 +208,10 @@ on conflict (version) do nothing;
 -- صلاحيات الدوال الجديدة: للمستخدم المسجَّل فقط
 grant execute on function public.wht_rates_list(jsonb), public.wht_rates_save(jsonb), public.wht_calc(jsonb), public.wht_record(jsonb), public.wht_list(jsonb), public.wht_report(jsonb), public.wht_remit(jsonb),
   public.rpt_segments(jsonb), public.dsr_create(jsonb), public.dsr_list(jsonb), public.dsr_update(jsonb) to authenticated;
+
+-- تصحيح صلاحيات (آمن للتكرار): لا وصول للزائر على الدوال الجديدة
+do $$ declare f record; begin
+  for f in select p.oid::regprocedure as sig from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname in ('wht_record','wht_remit','wht_report','wht_list','wht_calc','wht_rates_list','wht_rates_save','rpt_segments','dsr_create','dsr_list','dsr_update') loop
+    execute format('revoke execute on function %s from public, anon', f.sig);
+  end loop;
+end $$;
