@@ -1,4 +1,4 @@
-// Service Worker — مُحكَم للحسابات. أصول مُجزَّأة بالتجزئة: كاش أولًا. الصفحة وconfig.js: الشبكة أولًا. واجهة Supabase: لا تُخزَّن أبدًا.
+// Service Worker — مُحكَم للمحاسبة. أصول مُجزَّأة بالتجزئة: كاش أولًا. الصفحة وconfig.js: الشبكة أولًا. واجهة Supabase: لا تُخزَّن أبدًا.
 const V = 'acc-v1509r'; const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).catch(() => { /* */ })); self.skipWaiting(); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
