@@ -1,5 +1,5 @@
 // Service Worker — مُحكَم للمحاسبة. أصول مُجزَّأة بالتجزئة: كاش أولًا. الصفحة وconfig.js: الشبكة أولًا. واجهة Supabase: لا تُخزَّن أبدًا.
-const V = 'acc-7b75c9845f'; /* الرمز المؤقت في اسم الكاش يُستبدل ببصمة المحتوى عند البناء (vite.config.ts) فيتغير الملف مع كل إصدار */ const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
+const V = 'acc-8fe9ec6427'; /* الرمز المؤقت في اسم الكاش يُستبدل ببصمة المحتوى عند البناء (vite.config.ts) فيتغير الملف مع كل إصدار */ const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).catch(() => { /* */ })); /* بلا تفعيل فوري: النسخة الجديدة تنتظر حتى يضغط المستخدم «تحديث الآن» (UpdateNotice) */ });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
 self.addEventListener('message', e => { if (e.data === 'skip') self.skipWaiting(); });
